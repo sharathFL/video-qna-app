@@ -249,6 +249,55 @@ class VideoInferenceHandler(BaseHTTPRequestHandler):
                 "service": "video-inference (max-vote per video)",
             })
             return
+        if path == "/video":
+            qs = urllib.parse.parse_qs(parsed.query)
+            rel = (qs.get("path") or [None])[0]
+            if not rel:
+                self.send_response(400)
+                self.end_headers()
+                return
+            rel = rel.lstrip("/").replace("\\", "/")
+            video_path = (TEST_VIDEOS_ROOT / rel).resolve()
+            try:
+                video_path.relative_to(TEST_VIDEOS_ROOT.resolve())
+            except ValueError:
+                self.send_response(404)
+                self.end_headers()
+                return
+            if not video_path.exists() or not video_path.is_file():
+                self.send_response(404)
+                self.end_headers()
+                return
+            size = video_path.stat().st_size
+            range_header = self.headers.get("Range")
+            if range_header and range_header.startswith("bytes="):
+                try:
+                    part = range_header[6:].strip().split("-")
+                    start = int(part[0]) if part[0] else 0
+                    end = int(part[1]) if len(part) > 1 and part[1] else size - 1
+                    end = min(end, size - 1)
+                    length = end - start + 1
+                    self.send_response(206)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                    self.send_header("Content-Length", str(length))
+                    self.end_headers()
+                    with open(video_path, "rb") as f:
+                        f.seek(start)
+                        self.wfile.write(f.read(length))
+                except (ValueError, OSError):
+                    self.send_response(416)
+                    self.end_headers()
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(size))
+                self.end_headers()
+                with open(video_path, "rb") as f:
+                    self.wfile.write(f.read())
+            return
         if path == "/videos":
             videos = list_test_videos()
             self.send_json({"videos": videos, "root": str(TEST_VIDEOS_ROOT)})
@@ -306,6 +355,7 @@ class VideoInferenceHandler(BaseHTTPRequestHandler):
                 "endpoints": {
                     "GET /": "UI: load test video, run inference, see frame-wise distribution",
                     "GET /health": "Health check",
+                    "GET /video?path=...": "Stream .mp4 file (for playback). path = e.g. 4_safe_walkway/4_te1.mp4",
                     "GET /videos": "List .mp4 test videos (path, label, folder).",
                     "GET /infer-video?path=...": "Infer one .mp4: extract frames, per-frame prediction, max-vote. path = e.g. 4_safe_walkway/4_te1.mp4",
                     "GET /test-videos": "Run on pre-extracted test.jsonl videos. Query: ?max=N.",
@@ -341,11 +391,21 @@ button:hover:not(:disabled) { background: #ff6b6b; }
 .frame-list div { padding: 2px 0; }
 .links { margin-top: 20px; }
 .links a { margin-right: 12px; }
+.video-container { position: relative; display: inline-block; max-width: 100%; margin: 12px 0; background: #000; border-radius: 8px; overflow: hidden; }
+.video-container video { display: block; max-width: 100%; max-height: 70vh; }
+.video-overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0; pointer-events: none; display: flex; flex-direction: column; justify-content: space-between; padding: 12px; }
+.video-overlay .top { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 8px; }
+.video-overlay .badge { font-size: 18px; font-weight: bold; padding: 8px 16px; border-radius: 8px; text-shadow: 0 1px 2px rgba(0,0,0,0.8); }
+.video-overlay .badge.SAFE { background: rgba(46,125,50,0.9); color: #c8e6c9; }
+.video-overlay .badge.UNSAFE { background: rgba(198,40,40,0.9); color: #ffcdd2; }
+.video-overlay .final-badge { font-size: 12px; opacity: 0.95; }
+.video-overlay .current-frame { font-size: 14px; padding: 6px 12px; background: rgba(0,0,0,0.7); border-radius: 6px; align-self: flex-end; }
+.video-overlay .frame-pred { font-size: 22px; padding: 10px 20px; }
 </style>
 </head>
 <body>
 <h1>Video inference (max-vote)</h1>
-<p>Test videos are .mp4 files from the CCTV dataset. Select a video, run inference: we extract frames (1/sec), run per-frame prediction, then max-vote for the video label. Frame-wise distribution is shown below.</p>
+<p>Test videos are .mp4 files from the CCTV dataset. Select a video, run inference: we extract frames (1/sec), run per-frame prediction, then max-vote for the video label. Watch the video with the prediction overlay.</p>
 <div>
   <label for="videoSelect">Load video: </label>
   <select id="videoSelect"><option value="">-- loading list --</option></select>
@@ -353,6 +413,19 @@ button:hover:not(:disabled) { background: #ff6b6b; }
 </div>
 <div id="result">
   <h2>Result</h2>
+  <div class="video-container" id="videoContainer" style="display: none;">
+    <video id="resultVideo" controls playsinline></video>
+    <div class="video-overlay" id="videoOverlay">
+      <div class="top">
+        <span class="badge" id="overlayGT">—</span>
+        <div style="text-align: right;">
+          <div class="badge final-badge" id="overlayVideoPred">Video: —</div>
+          <div class="badge frame-pred" id="overlayPred">—</div>
+        </div>
+      </div>
+      <div class="current-frame" id="currentFrameLabel">Frame: —</div>
+    </div>
+  </div>
   <p><strong>Video:</strong> <span id="resPath"></span></p>
   <p><strong>Ground truth:</strong> <span id="resGT"></span> &nbsp; <strong>Prediction:</strong> <span id="resPred"></span> <span id="resCorrect"></span></p>
   <div class="vote-summary"><span class="SAFE" id="voteSAFE">SAFE: 0</span> <span class="UNSAFE" id="voteUNSAFE">UNSAFE: 0</span></div>
@@ -368,6 +441,12 @@ button:hover:not(:disabled) { background: #ff6b6b; }
 const videoSelect = document.getElementById('videoSelect');
 const runBtn = document.getElementById('runBtn');
 const result = document.getElementById('result');
+const videoContainer = document.getElementById('videoContainer');
+const resultVideo = document.getElementById('resultVideo');
+const videoOverlay = document.getElementById('videoOverlay');
+const overlayGT = document.getElementById('overlayGT');
+const overlayPred = document.getElementById('overlayPred');
+const currentFrameLabel = document.getElementById('currentFrameLabel');
 const resPath = document.getElementById('resPath');
 const resGT = document.getElementById('resGT');
 const resPred = document.getElementById('resPred');
@@ -376,6 +455,18 @@ const voteSAFE = document.getElementById('voteSAFE');
 const voteUNSAFE = document.getElementById('voteUNSAFE');
 const frameDist = document.getElementById('frameDist');
 const frameList = document.getElementById('frameList');
+
+let lastFrameDistribution = [];
+
+function getFrameAtTime(timeSec) {
+  if (!lastFrameDistribution.length) return null;
+  let best = lastFrameDistribution[0];
+  for (const f of lastFrameDistribution) {
+    if (f.time_sec <= timeSec) best = f;
+    else break;
+  }
+  return best;
+}
 
 fetch('/videos').then(r => r.json()).then(data => {
   videoSelect.innerHTML = '<option value="">-- choose a video --</option>';
@@ -394,6 +485,7 @@ runBtn.addEventListener('click', () => {
   runBtn.disabled = true;
   frameDist.innerHTML = '';
   frameList.innerHTML = 'Loading...';
+  videoContainer.style.display = 'none';
   fetch('/infer-video?path=' + encodeURIComponent(path)).then(r => r.json()).then(data => {
     runBtn.disabled = false;
     if (data.error) {
@@ -406,9 +498,11 @@ runBtn.addEventListener('click', () => {
       voteUNSAFE.textContent = 'UNSAFE: 0';
       frameDist.innerHTML = '';
       frameList.innerHTML = '';
+      lastFrameDistribution = [];
       return;
     }
     result.classList.add('show');
+    lastFrameDistribution = data.frame_distribution || [];
     resPath.textContent = data.video_path || path;
     resGT.textContent = data.ground_truth || '-';
     resPred.textContent = data.prediction || '-';
@@ -417,23 +511,43 @@ runBtn.addEventListener('click', () => {
     voteSAFE.textContent = 'SAFE: ' + (data.frame_votes && data.frame_votes.SAFE != null ? data.frame_votes.SAFE : 0);
     voteUNSAFE.textContent = 'UNSAFE: ' + (data.frame_votes && data.frame_votes.UNSAFE != null ? data.frame_votes.UNSAFE : 0);
     frameDist.innerHTML = '';
-    (data.frame_distribution || []).forEach(f => {
+    lastFrameDistribution.forEach(f => {
       const span = document.createElement('span');
       span.className = 'frame ' + (f.prediction === 'SAFE' || f.prediction === 'UNSAFE' ? f.prediction : 'other');
       span.title = 'Frame ' + f.frame_index + ' @ ' + f.time_sec + 's: ' + (f.prediction || '');
       frameDist.appendChild(span);
     });
     frameList.innerHTML = '';
-    (data.frame_distribution || []).forEach(f => {
+    lastFrameDistribution.forEach(f => {
       const div = document.createElement('div');
       div.textContent = 'Frame ' + f.frame_index + ' (t=' + f.time_sec + 's): ' + (f.prediction || '-');
       frameList.appendChild(div);
     });
+    // Show video with overlay: top-right big badge = current frame prediction; small = video max-vote
+    videoContainer.style.display = 'inline-block';
+    resultVideo.src = '/video?path=' + encodeURIComponent(data.video_path || path);
+    overlayGT.textContent = 'GT: ' + (data.ground_truth || '—');
+    overlayGT.className = 'badge ' + (data.ground_truth === 'SAFE' ? 'SAFE' : 'UNSAFE');
+    const overlayVideoPred = document.getElementById('overlayVideoPred');
+    overlayVideoPred.textContent = 'Video: ' + (data.prediction || '—');
+    function setOverlayForFrame(f) {
+      const pred = f ? (f.prediction || '—') : '—';
+      overlayPred.textContent = pred;
+      overlayPred.className = 'badge frame-pred ' + (pred === 'SAFE' ? 'SAFE' : pred === 'UNSAFE' ? 'UNSAFE' : '');
+      currentFrameLabel.textContent = f ? 'Frame ' + f.frame_index + ' (' + f.time_sec + 's): ' + (f.prediction || '—') : 'Frame: —';
+    }
+    setOverlayForFrame(lastFrameDistribution[0] || null);
+    resultVideo.ontimeupdate = function() {
+      const t = Math.floor(resultVideo.currentTime);
+      setOverlayForFrame(getFrameAtTime(t));
+    };
   }).catch(err => {
     runBtn.disabled = false;
     result.classList.add('show');
     resPred.textContent = err.message || 'Request failed';
     frameList.innerHTML = '';
+    videoContainer.style.display = 'none';
+    lastFrameDistribution = [];
   });
 });
 </script>
