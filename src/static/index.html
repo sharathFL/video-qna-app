@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Video inference — Safe/Unsafe</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <h1>Video inference (max-vote)</h1>
+  <p>Select a video and run inference. The per-frame predictions are shown with a prediction overlay.</p>
+  <div class="controls">
+    <label for="videoSelect">Load video: </label>
+    <select id="videoSelect"><option value="">-- loading list --</option></select>
+    <button id="runBtn" disabled>Run inference</button>
+  </div>
+  <div id="result">
+    <h2>Result</h2>
+    <div class="video-container" id="videoContainer" style="display: none;">
+      <video id="resultVideo" controls playsinline></video>
+      <div class="video-overlay" id="videoOverlay">
+        <div class="top">
+          <span class="badge" id="overlayGT">—</span>
+          <div class="overlay-right">
+            <div class="badge final-badge" id="overlayVideoPred">Video: —</div>
+            <div class="badge frame-pred" id="overlayPred">—</div>
+          </div>
+        </div>
+        <div class="current-frame" id="currentFrameLabel">Frame: —</div>
+      </div>
+    </div>
+    <p><strong>Video:</strong> <span id="resPath"></span></p>
+    <p><strong>Ground truth:</strong> <span id="resGT"></span> &nbsp; <strong>Prediction:</strong> <span id="resPred"></span> <span id="resCorrect"></span></p>
+    <div class="vote-summary"><span class="SAFE" id="voteSAFE">SAFE: 0</span> <span class="UNSAFE" id="voteUNSAFE">UNSAFE: 0</span></div>
+    <div class="dist-label">Frame-wise distribution (each block = one frame)</div>
+    <div id="frameDist"></div>
+    <details><summary>Frame list</summary><div class="frame-list" id="frameList"></div></details>
+  </div>
+  <div class="links">
+    <a href="/test-videos?max=5">Batch: 5 test videos (JSONL)</a>
+    <a href="/info">API info</a>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
