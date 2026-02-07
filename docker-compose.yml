@@ -1,0 +1,32 @@
+services:
+  vlm:
+    build: .
+    container_name: vlm_safe_unsafe
+    working_dir: /workspace
+    # Run only video inference on 8082 (model loaded once at startup). No service on 8081.
+    command: ["python", "src/serve_video_inference.py", "--checkpoint", "/workspace/outputs/checkpoint-990"]
+    volumes:
+      - ./data:/workspace/data:rw
+      - ./src:/workspace/src:rw
+      - ./outputs:/workspace/outputs:rw
+      - ./cache/hf:/workspace/.cache/huggingface:rw
+    environment:
+      # Use first GPU (RTX A4000); set to "0" or "1,2" etc. to choose GPUs
+      - NVIDIA_VISIBLE_DEVICES=0
+      - CUDA_VISIBLE_DEVICES=0
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HF_HOME=/workspace/.cache/huggingface
+      - TRANSFORMERS_CACHE=/workspace/.cache/huggingface
+    shm_size: "2gb"
+    stdin_open: true
+    tty: true
+    ports:
+      - "8080:8080"
+      - "8082:8082"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

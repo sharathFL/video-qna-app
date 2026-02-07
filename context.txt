@@ -1,0 +1,191 @@
+CONTEXT FILE — Safe / Unsafe Handling VLM Demo
+Objective
+
+Build a GPU-accelerated VLM fine-tuning demo that classifies CCTV footage into SAFE / UNSAFE workplace handling behavior (dock / industrial setting).
+
+Binary output only: SAFE or UNSAFE
+
+Near-real-time capable
+
+Trained on an existing labeled dataset
+
+Runs inside Docker with NVIDIA GPU (A1000) access
+
+Data is volume-mounted (no data baked into image)
+
+Dataset (already downloaded)
+
+Name: Video Dataset for Safe and Unsafe Behaviours (Mendeley Data)
+Structure (exact):
+
+Safe and Unsafe Behaviours Dataset/
+├── train/
+│   ├── 0_safe_walkway_violation/
+│   ├── 1_unauthorized_intervention/
+│   ├── 2_opened_panel_cover/
+│   ├── 3_carrying_overload_with_forklift/
+│   ├── 4_safe_walkway/
+│   ├── 5_authorized_intervention/
+│   ├── 6_closed_panel_cover/
+│   └── 7_safe_carrying/
+└── test/
+    ├── same class folders as train/
+
+
+Each folder contains .mp4 CCTV videos.
+
+Label Mapping (IMPORTANT)
+UNSAFE
+0_safe_walkway_violation
+1_unauthorized_intervention
+2_opened_panel_cover
+3_carrying_overload_with_forklift
+
+SAFE
+4_safe_walkway
+5_authorized_intervention
+6_closed_panel_cover
+7_safe_carrying
+
+
+Collapse all 8 classes → binary SAFE / UNSAFE.
+
+Processing Pipeline
+Step 1 — Frame Extraction
+
+Extract 1 frame per second from each video
+
+Preserve train / test split
+
+Output structure:
+
+frames/
+├── train/
+│   ├── safe/<video_id>/*.jpg
+│   └── unsafe/<video_id>/*.jpg
+└── test/
+    ├── safe/<video_id>/*.jpg
+    └── unsafe/<video_id>/*.jpg
+
+Step 2 — VLM Training Samples
+
+Build a JSONL file where each frame = one sample:
+
+{
+  "image": "frames/train/unsafe/video_123/0004.jpg",
+  "prompt": "You are a workplace safety inspector reviewing CCTV footage. Classify the behavior as SAFE or UNSAFE. Answer with only one word.",
+  "response": "UNSAFE"
+}
+
+Step 3 — Model Training
+
+Model: Qwen/Qwen2-VL-7B-Instruct
+
+Method: QLoRA (4-bit)
+
+Task: Vision → text classification
+
+Output tokens: strictly SAFE or UNSAFE
+
+Epochs: 2–3 (demo quality)
+
+Docker + GPU Setup (MANDATORY)
+Folder Layout (host)
+safe_unsafe_demo/
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+├── data/        # <-- dataset mounted here
+├── src/         # <-- python scripts
+├── outputs/
+└── cache/hf/
+
+docker-compose.yml
+services:
+  vlm:
+    build: .
+    container_name: vlm_safe_unsafe
+    working_dir: /workspace
+    volumes:
+      - ./data:/workspace/data:rw
+      - ./src:/workspace/src:rw
+      - ./outputs:/workspace/outputs:rw
+      - ./cache/hf:/workspace/.cache/huggingface:rw
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HF_HOME=/workspace/.cache/huggingface
+      - TRANSFORMERS_CACHE=/workspace/.cache/huggingface
+    shm_size: "2gb"
+    stdin_open: true
+    tty: true
+    gpus: all
+
+Dockerfile
+FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+
+WORKDIR /workspace
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ffmpeg libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /workspace/requirements.txt
+RUN pip install --no-cache-dir -r /workspace/requirements.txt
+
+CMD ["/bin/bash"]
+
+requirements.txt
+transformers>=4.44.0
+accelerate>=0.33.0
+peft>=0.12.0
+bitsandbytes>=0.43.0
+pillow
+opencv-python
+
+Runtime Notes
+
+Dataset root inside container:
+
+/workspace/data/Safe and Unsafe Behaviours Dataset/
+
+
+GPU must be visible:
+
+nvidia-smi
+torch.cuda.is_available() == True
+
+
+All scripts executed manually inside container:
+
+docker compose up -d
+docker exec -it vlm_safe_unsafe bash
+cd /workspace/src
+
+Deliverables Expected from Coding Agent
+
+extract_frames.py
+
+build_jsonl.py
+
+train_vlm.py (QLoRA fine-tuning)
+
+infer.py (single-frame inference)
+
+All paths aligned with mounted volumes
+
+No hardcoded local paths
+
+Non-Goals (for this phase)
+
+❌ No multi-class output
+
+❌ No explanations / reason codes
+
+❌ No temporal aggregation
+
+❌ No alerting logic
+
+❌ No RTSP ingestion
+
+Binary SAFE / UNSAFE demo only.
