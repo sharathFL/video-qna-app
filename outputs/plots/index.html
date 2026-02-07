@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>SmolVLM2 Training</title>
+<meta http-equiv="refresh" content="30"/>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+body { font-family: sans-serif; margin: 20px; background: #1a1a2e; color: #eee; }
+h1 { color: #e94560; } .section { margin: 24px 0; }
+img { border-radius: 8px; border: 2px solid #333; }
+table { border-collapse: collapse; } th, td { padding: 8px 12px; text-align: left; border: 1px solid #444; }
+th { background: #16213e; } a { color: #e94560; }
+#stats { font-family: monospace; background: #0f0f1a; padding: 12px; border-radius: 8px; white-space: pre-wrap; }
+.plots-row { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; }
+.plot-container { flex: 1; min-width: 400px; max-width: 50%; }
+.plot-container .plot { width: 100%; height: 360px; }
+#checkpoint-alert { display: none; padding: 16px 24px; border-radius: 8px; margin-bottom: 16px; font-weight: bold; font-size: 1.1em; text-align: center; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+#checkpoint-alert.recent { display: block; position: sticky; top: 0; z-index: 999; background: #2e7d32; color: #fff; border: 2px solid #4caf50; animation: pulse 1.5s ease-in-out 5; font-size: 1.25em; }
+#checkpoint-alert.old { display: block; background: #37474f; color: #cfd8dc; border: 1px solid #546e7a; }
+@keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.9; transform: scale(1.01); } }
+#url-hint { background: #2e7d32; color: #fff; padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; }
+</style></head><body>
+<p id="url-hint"><strong>Dashboard:</strong> Open at <a href="http://localhost:8080/" style="color:#fff; text-decoration:underline">http://localhost:8080/</a> in your browser (do not open the HTML file directly).</p>
+<h1>SmolVLM2 — Live Training</h1>
+<p>Step: <b>45</b>  (4% | 45/1066) | Updated. | <em>Auto-refresh 30s</em></p>
+<div id="checkpoint-alert"></div>
+<div class="section"><h2>System &amp; training stats</h2><div id="stats">Loading...</div></div>
+<div class="section"><h2>Plots</h2>
+<div class="plots-row">
+  <div class="plot-container"><h3>Training loss</h3><div id="loss-plot" class="plot"></div></div>
+  <div class="plot-container"><h3>Training accuracy (sample)</h3><div id="accuracy-plot" class="plot"></div></div>
+</div></div>
+<div class="section"><h2>Sample inputs &amp; predictions (5 frames, rotating across dataset each update)</h2>
+<p style="color:#888; font-size:0.9em;">Refresh every <b>20</b> steps (use <code>--plot-every N</code> to change; page auto-refreshes every 30s)</p>
+<table><tr><th>Input frame</th><th>Ground truth</th><th>Prediction</th><th>Step</th><th>Idx</th></tr>
+<tr><td><img src="sample_0.png?v=45" width="160" alt=""/></td><td>SAFE</td><td>SAFE</td><td>Step 45</td><td>Idx 426</td></tr><tr><td><img src="sample_1.png?v=45" width="160" alt=""/></td><td>UNSAFE</td><td>UNSAFE</td><td>Step 45</td><td>Idx 1490</td></tr><tr><td><img src="sample_2.png?v=45" width="160" alt=""/></td><td>UNSAFE</td><td>UNSAFE</td><td>Step 45</td><td>Idx 2555</td></tr><tr><td><img src="sample_3.png?v=45" width="160" alt=""/></td><td>UNSAFE</td><td>UNSAFE</td><td>Step 45</td><td>Idx 3620</td></tr><tr><td><img src="sample_4.png?v=45" width="160" alt=""/></td><td>SAFE</td><td>SAFE</td><td>Step 45</td><td>Idx 425</td></tr>
+</table></div>
+<div class="section"><h2>Input grid</h2><img src="input_grid.png?v=45" width="800" alt="Input samples" onerror="this.alt='Waiting for first update...'"/></div>
+<div class="section"><h2>Log tail</h2><a href="/log.txt">/log.txt</a></div>
+<script>
+(function() {
+  if (window.location.protocol === 'file:') {
+    document.body.insertAdjacentHTML('afterbegin', '<div style="background:#c62828;color:#fff;padding:16px;margin-bottom:16px;border-radius:8px;"><strong>Wrong URL.</strong> You opened this as a file. Open <a href="http://localhost:8080/" style="color:#fff; text-decoration:underline">http://localhost:8080/</a> in your browser instead (training server must be running).</div>');
+    var h = document.getElementById('url-hint');
+    if (h) h.style.display = 'none';
+  } else {
+    var h = document.getElementById('url-hint');
+    if (h) h.style.display = 'none';
+  }
+})();
+var lossLayout = { title: 'Loss', paper_bgcolor: '#0f0f1a', plot_bgcolor: '#0f0f1a', font: { color: '#eee' }, xaxis: { gridcolor: '#333' }, yaxis: { gridcolor: '#333' } };
+var accLayout = { title: 'Accuracy (%)', paper_bgcolor: '#0f0f1a', plot_bgcolor: '#0f0f1a', font: { color: '#eee' }, xaxis: { gridcolor: '#333' }, yaxis: { gridcolor: '#333', range: [0, 105] }, margin: { t: 40 } };
+function drawPlots() {
+  if (typeof Plotly === 'undefined') {
+    document.getElementById('loss-plot').innerHTML = '<p style="color:#888">Plotly loading or blocked. Enable script from cdn.plot.ly or check network.</p>';
+    document.getElementById('accuracy-plot').innerHTML = '<p style="color:#888">Plotly loading or blocked.</p>';
+    return;
+  }
+  fetch('/plot_data.json?t='+Date.now()).then(r=>r.json()).then(d=>{
+    if (d.loss && d.loss.steps && d.loss.steps.length) {
+      Plotly.newPlot('loss-plot', [{ x: d.loss.steps, y: d.loss.values, type: 'scatter', mode: 'lines+markers', marker: { size: 4 }, line: { color: '#3498db' } }], lossLayout, { responsive: true });
+    }
+    if (d.accuracy && d.accuracy.steps && d.accuracy.steps.length) {
+      Plotly.newPlot('accuracy-plot', [{ x: d.accuracy.steps, y: d.accuracy.values, type: 'scatter', mode: 'lines+markers', marker: { size: 4 }, line: { color: '#2ecc71' } }], accLayout, { responsive: true });
+    }
+  }).catch(function() {});
+}
+function loadStats() {
+  fetch('/stats.json?t='+Date.now()).then(r=>r.json()).then(s=>{
+    var t = 'Time (training): ' + (s.training_elapsed_hms || s.training_elapsed_sec + 's') + '\n';
+    t += 'Eval: ' + (s.eval_sec != null ? s.eval_sec + 's' : 'N/A') + ' | Test: ' + (s.test_sec != null ? s.test_sec + 's' : 'N/A') + '\n';
+    t += 'GPU: ' + (s.gpu_util_pct != null ? s.gpu_util_pct + '%' : 'N/A') + ' | Mem ' + (s.gpu_mem_used_mb != null ? s.gpu_mem_used_mb + '/' + s.gpu_mem_total_mb + ' MB' : 'N/A') + ' | Temp ' + (s.gpu_temp_c != null ? s.gpu_temp_c + '°C' : 'N/A') + '\n';
+    t += 'CPU: ' + (s.cpu_pct != null ? s.cpu_pct + '%' : 'N/A') + ' | RAM: ' + (s.ram_used_mb != null ? s.ram_used_mb + ' / ' + s.ram_total_mb + ' MB' : 'N/A') + '\n';
+    t += 'Disk: ' + (s.disk_free_gb != null ? s.disk_free_gb + ' / ' + s.disk_total_gb + ' GB free' : 'N/A') + '\n';
+    t += 'Sample accuracy: ' + (s.sample_accuracy_pct != null ? s.sample_accuracy_pct + '%' : 'N/A');
+    document.getElementById('stats').textContent = t;
+  }).catch(function() { document.getElementById('stats').textContent = 'Stats unavailable'; });
+}
+function loadCheckpointAlert() {
+  fetch('/checkpoint_alert.json?t='+Date.now()).then(r=>r.json()).then(c=>{
+    var el = document.getElementById('checkpoint-alert');
+    if (!c || !c.step) { el.style.display = 'none'; return; }
+    var msg = 'CHECKPOINT SAVED — ' + (c.path || ('checkpoint-' + c.step)) + ' (step ' + c.step + ')';
+    if (c.at) msg += ' at ' + c.at;
+    el.textContent = msg;
+    el.className = (Date.now()/1000 - c.at_sec) < 120 ? 'recent' : 'old';
+  }).catch(function() { document.getElementById('checkpoint-alert').style.display = 'none'; });
+}
+drawPlots(); loadStats(); loadCheckpointAlert();
+setInterval(drawPlots, 5000); setInterval(loadStats, 5000); setInterval(loadCheckpointAlert, 3000);
+</script>
+</body></html>

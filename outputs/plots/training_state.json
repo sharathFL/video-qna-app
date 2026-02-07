@@ -1,0 +1,8 @@
+{
+  "step": 45,
+  "training_elapsed_sec": 116.9,
+  "training_elapsed_hms": "0h 1m 56s",
+  "eval_sec": null,
+  "test_sec": null,
+  "sample_accuracy_pct": 100.0
+}

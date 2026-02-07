@@ -1,0 +1,21 @@
+{
+  "accuracy": {
+    "train": 1.0,
+    "eval": 1.0,
+    "test": 0.6
+  },
+  "counts": {
+    "train": {
+      "correct": 5,
+      "total": 5
+    },
+    "eval": {
+      "correct": 5,
+      "total": 5
+    },
+    "test": {
+      "correct": 3,
+      "total": 5
+    }
+  }
+}
