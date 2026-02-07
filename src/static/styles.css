@@ -1,0 +1,217 @@
+/* Video inference UI — edit look and feel here */
+
+body {
+  font-family: system-ui, sans-serif;
+  margin: 24px;
+  background: #1a1a2e;
+  color: #eee;
+  max-width: 900px;
+}
+
+h1 {
+  color: #e94560;
+}
+
+a {
+  color: #e94560;
+}
+
+.controls {
+  margin: 16px 0;
+}
+
+.controls select {
+  padding: 8px 12px;
+  font-size: 14px;
+  min-width: 280px;
+  background: #0f0f1a;
+  color: #eee;
+  border: 1px solid #333;
+  border-radius: 6px;
+}
+
+.controls button {
+  padding: 10px 20px;
+  font-size: 14px;
+  background: #e94560;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.controls button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.controls button:hover:not(:disabled) {
+  background: #ff6b6b;
+}
+
+#result {
+  margin-top: 20px;
+  padding: 16px;
+  background: #0f0f1a;
+  border-radius: 8px;
+  display: none;
+}
+
+#result.show {
+  display: block;
+}
+
+#result h2 {
+  margin-top: 0;
+  color: #e94560;
+}
+
+.vote-summary {
+  display: flex;
+  gap: 24px;
+  margin: 12px 0;
+}
+
+.vote-summary span {
+  padding: 4px 10px;
+  border-radius: 4px;
+}
+
+.vote-summary .SAFE {
+  background: #1b5e20;
+  color: #a5d6a7;
+}
+
+.vote-summary .UNSAFE {
+  background: #b71c1c;
+  color: #ef9a9a;
+}
+
+.dist-label {
+  font-size: 12px;
+  color: #888;
+  margin-bottom: 6px;
+}
+
+#frameDist {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin: 8px 0;
+  min-height: 24px;
+}
+
+#frameDist .frame {
+  width: 12px;
+  height: 20px;
+  border-radius: 2px;
+}
+
+#frameDist .frame.SAFE {
+  background: #2e7d32;
+}
+
+#frameDist .frame.UNSAFE {
+  background: #c62828;
+}
+
+#frameDist .frame.other {
+  background: #555;
+}
+
+.frame-list {
+  max-height: 200px;
+  overflow-y: auto;
+  font-size: 12px;
+  font-family: monospace;
+}
+
+.frame-list div {
+  padding: 2px 0;
+}
+
+.links {
+  margin-top: 20px;
+}
+
+.links a {
+  margin-right: 12px;
+}
+
+/* Video container and overlay */
+.video-container {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  margin: 12px 0;
+  background: #000;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.video-container video {
+  display: block;
+  max-width: 100%;
+  max-height: 70vh;
+}
+
+.video-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 12px;
+}
+
+.video-overlay .top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.video-overlay .badge {
+  font-size: 18px;
+  font-weight: bold;
+  padding: 8px 16px;
+  border-radius: 8px;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
+
+.video-overlay .badge.SAFE {
+  background: rgba(46, 125, 50, 0.9);
+  color: #c8e6c9;
+}
+
+.video-overlay .badge.UNSAFE {
+  background: rgba(198, 40, 40, 0.9);
+  color: #ffcdd2;
+}
+
+.video-overlay .final-badge {
+  font-size: 12px;
+  opacity: 0.95;
+}
+
+.video-overlay .overlay-right {
+  text-align: right;
+}
+
+.video-overlay .current-frame {
+  font-size: 14px;
+  padding: 6px 12px;
+  background: rgba(0, 0, 0, 0.7);
+  border-radius: 6px;
+  align-self: flex-end;
+}
+
+.video-overlay .frame-pred {
+  font-size: 22px;
+  padding: 10px 20px;
+}
