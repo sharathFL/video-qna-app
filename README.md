@@ -14,10 +14,24 @@ This demo fine-tunes Qwen2-VL-7B-Instruct using QLoRA (4-bit) to perform binary 
 
 ## Quick Start
 
-### 1. Build and Start Container
+### 1. Build and Start Containers
 
 ```bash
 docker compose up -d
+```
+
+**Port map (bookmark this):** Open **http://localhost:8080/** in your browser. You get a single page listing what runs where:
+
+| Port | Service |
+|------|--------|
+| **8080** | Port map (this page) |
+| **8082** | Video inference (CCTV test videos) |
+| **8083** | YouTube inference (paste a YouTube URL) |
+
+If **8083** doesn’t load, ensure the YouTube service is up: `docker compose ps` and check that `vlm_youtube` is running.
+
+To shell into the main container:
+```bash
 docker exec -it vlm_safe_unsafe bash
 ```
 
@@ -56,25 +70,19 @@ This will:
 
 **Note:** First run will download the model (~14GB), which may take time.
 
-**Live dashboard:** While training, open **http://localhost:8080/** in your browser. The page auto-refreshes every 5 seconds and shows:
-- Training loss curve (updated every N steps)
-- Sample input frames and the model’s SAFE/UNSAFE predictions
-- Input grid of the current sample batch
-
-Ensure port 8080 is exposed (see `docker-compose.yml`).
+**Live dashboard:** When you run training (e.g. inside the container), the training dashboard uses port 8080 for binary or 8081 for multiclass. If you use `docker compose up` for inference only, port 8080 serves the **port map** (see above). Ensure ports are exposed in `docker-compose.yml`.
 
 ### 5. Run Inference
 
-**Frame inference (port 8081):** Upload a single image or run on test frames.
+With `docker compose up`, inference is already running:
+- **http://localhost:8080/** — Port map (links to 8082 and 8083)
+- **http://localhost:8082/** — Video inference (CCTV test videos; max-vote per video)
+- **http://localhost:8083/** — YouTube inference (paste a URL; no download)
+
+To run frame inference manually (single image upload, port 8081):
 ```bash
 python serve_inference.py --checkpoint /workspace/outputs/checkpoint-990
 # Open http://localhost:8081/
-```
-
-**Video inference (port 8082):** Run on CCTV test data by video; each video’s frames are inferred and aggregated by **max-vote** to produce one SAFE/UNSAFE label per video.
-```bash
-python serve_video_inference.py --checkpoint /workspace/outputs/checkpoint-990
-# Open http://localhost:8082/ — then GET /test-videos or /test-videos?max=5
 ```
 
 Single image from CLI:
@@ -104,6 +112,31 @@ Models: `HuggingFaceTB/SmolVLM2-2.2B-Instruct`, `HuggingFaceTB/SmolVLM2-500M-Vid
 python train_llava.py --dry-run   # test
 python train_llava.py             # full training
 ```
+
+### Multiclass training (8 classes)
+
+To train on **all 8 behavior classes** (instead of binary safe/unsafe), use the multiclass pipeline. All intermediate data, models, logs, and plots are kept **separate** from the binary setup:
+
+| Binary (safe/unsafe)     | Multiclass (8 classes)           |
+|--------------------------|-----------------------------------|
+| `data/frames/`           | `data/frames_multiclass/`        |
+| `data/train.jsonl`       | `data/train_multiclass.jsonl`    |
+| `data/test.jsonl`        | `data/test_multiclass.jsonl`     |
+| `outputs/`               | `outputs_multiclass/`             |
+| Dashboard port 8080      | Dashboard port **8081**          |
+
+**Steps (inside container):**
+```bash
+cd /workspace/src
+# 1. Extract frames keeping 8 class folders (no mapping to safe/unsafe)
+python extract_frames_multiclass.py
+# 2. Build JSONL with class names as labels
+python build_jsonl_multiclass.py
+# 3. Train; dashboard at http://localhost:8081/
+python -u train_smolvlm_multiclass.py --model HuggingFaceTB/SmolVLM2-2.2B-Instruct >> /workspace/outputs_multiclass/train.log 2>&1
+```
+
+Mount `outputs_multiclass` if you run training in Docker: add `- ./outputs_multiclass:/workspace/outputs_multiclass:rw` to your run or compose volumes.
 
 ## Dataset Structure
 
@@ -140,9 +173,8 @@ data/
 
 ## Outputs
 
-- **Frames:** `/workspace/data/frames/`
-- **JSONL files:** `/workspace/data/train.jsonl`, `/workspace/data/test.jsonl`
-- **Trained model:** `/workspace/outputs/`
+- **Binary (safe/unsafe):** Frames `data/frames/`, JSONL `data/train.jsonl` / `data/test.jsonl`, model `outputs/`
+- **Multiclass (8 classes):** Frames `data/frames_multiclass/`, JSONL `data/train_multiclass.jsonl` / `data/test_multiclass.jsonl`, model `outputs_multiclass/`
 - **Model cache:** `/workspace/.cache/huggingface/`
 
 ## Troubleshooting
@@ -164,8 +196,8 @@ python -c "import torch; print(torch.cuda.is_available())"  # Should be True
 
 ## Notes
 
-- Binary classification only (SAFE/UNSAFE)
-- No multi-class output
+- **Binary** (default): SAFE/UNSAFE via `extract_frames.py` → `build_jsonl.py` → `train_smolvlm.py` → `outputs/`
+- **Multiclass**: 8 classes via `extract_frames_multiclass.py` → `build_jsonl_multiclass.py` → `train_smolvlm_multiclass.py` → `outputs_multiclass/`
 - No explanations or reason codes
 - Single-frame inference (no temporal aggregation)
 - Demo quality (2-3 epochs)
