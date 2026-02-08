@@ -60,6 +60,87 @@ fetch('/videos')
     runBtn.disabled = false;
   });
 
+// Full test: run all test videos, show progress and metrics
+(function () {
+  var runFullTestBtn = document.getElementById('runFullTestBtn');
+  var fullTestProgress = document.getElementById('fullTestProgress');
+  var fullTestStatus = document.getElementById('fullTestStatus');
+  var fullTestProgressFill = document.getElementById('fullTestProgressFill');
+  var fullTestMetrics = document.getElementById('fullTestMetrics');
+  var metricAccuracy = document.getElementById('metricAccuracy');
+  var metricCorrect = document.getElementById('metricCorrect');
+  var metricTotal = document.getElementById('metricTotal');
+
+  if (!runFullTestBtn) return;
+
+  var pollInterval = null;
+
+  function stopPolling() {
+    if (pollInterval) {
+      clearInterval(pollInterval);
+      pollInterval = null;
+    }
+  }
+
+  function updateProgress(current, total) {
+    fullTestStatus.textContent = total ? current + ' / ' + total + ' videos' : 'Starting…';
+    var pct = total ? Math.round((100 * current) / total) : 0;
+    fullTestProgressFill.style.width = pct + '%';
+  }
+
+  function pollStatus() {
+    fetch('/test-status')
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        updateProgress(data.current || 0, data.total || 0);
+        if (data.error) {
+          stopPolling();
+          fullTestStatus.textContent = 'Error: ' + data.error;
+          runFullTestBtn.disabled = false;
+          return;
+        }
+        if (data.done) {
+          stopPolling();
+          fullTestStatus.textContent = 'Done.';
+          runFullTestBtn.disabled = false;
+          fullTestMetrics.classList.remove('hidden');
+          metricAccuracy.textContent = data.accuracy != null ? data.accuracy : '—';
+          metricCorrect.textContent = data.correct != null ? data.correct : '—';
+          metricTotal.textContent = data.total != null ? data.total : '—';
+        }
+      })
+      .catch(function (err) {
+        stopPolling();
+        fullTestStatus.textContent = 'Request failed: ' + (err.message || 'unknown');
+        runFullTestBtn.disabled = false;
+      });
+  }
+
+  runFullTestBtn.addEventListener('click', function () {
+    if (runFullTestBtn.disabled) return;
+    runFullTestBtn.disabled = true;
+    fullTestMetrics.classList.add('hidden');
+    fullTestProgress.classList.remove('hidden');
+    updateProgress(0, 0);
+
+    fetch('/run-test')
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.error && data.error !== 'Test already in progress') {
+          fullTestStatus.textContent = data.error;
+          runFullTestBtn.disabled = false;
+          return;
+        }
+        pollStatus();
+        pollInterval = setInterval(pollStatus, 1000);
+      })
+      .catch(function (err) {
+        fullTestStatus.textContent = 'Failed to start: ' + (err.message || 'unknown');
+        runFullTestBtn.disabled = false;
+      });
+  });
+})();
+
 runBtn.addEventListener('click', function () {
   const path = videoSelect.value;
   if (!path) return;
