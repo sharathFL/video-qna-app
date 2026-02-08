@@ -32,11 +32,18 @@ function getFrameAtTime(timeSec) {
   return best;
 }
 
+function frameLabel(f) {
+  if (!f) return 'Frame: —';
+  var t = 'Frame ' + f.frame_index + ' (' + f.time_sec + 's): ' + (f.prediction || '—');
+  if (f.reason && f.reason.trim()) t += ' — ' + f.reason.trim();
+  return t;
+}
+
 function setOverlayForFrame(overlayPredEl, currentFrameLabelEl, f) {
   const pred = f ? (f.prediction || '—') : '—';
   overlayPredEl.textContent = pred;
   overlayPredEl.className = 'badge frame-pred ' + (pred === 'SAFE' ? 'SAFE' : pred === 'UNSAFE' ? 'UNSAFE' : '');
-  currentFrameLabelEl.textContent = f ? 'Frame ' + f.frame_index + ' (' + f.time_sec + 's): ' + (f.prediction || '—') : 'Frame: —';
+  currentFrameLabelEl.textContent = frameLabel(f);
 }
 
 // Load video list
@@ -92,13 +99,13 @@ runBtn.addEventListener('click', function () {
       lastFrameDistribution.forEach(function (f) {
         const span = document.createElement('span');
         span.className = 'frame ' + (f.prediction === 'SAFE' || f.prediction === 'UNSAFE' ? f.prediction : 'other');
-        span.title = 'Frame ' + f.frame_index + ' @ ' + f.time_sec + 's: ' + (f.prediction || '');
+        span.title = frameLabel(f);
         frameDist.appendChild(span);
       });
       frameList.innerHTML = '';
       lastFrameDistribution.forEach(function (f) {
         const div = document.createElement('div');
-        div.textContent = 'Frame ' + f.frame_index + ' (t=' + f.time_sec + 's): ' + (f.prediction || '-');
+        div.textContent = frameLabel(f);
         frameList.appendChild(div);
       });
 

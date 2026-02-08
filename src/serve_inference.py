@@ -26,6 +26,11 @@ OUTPUT_DIR = Path("/workspace/outputs")
 TEST_JSONL = DATA_DIR / "test.jsonl"
 SMOLVLM2_2B = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
 PROMPT = "You are a workplace safety inspector reviewing CCTV footage. Classify the behavior as SAFE or UNSAFE. Answer with only one word."
+PROMPT_WITH_REASON = (
+    "You are a workplace safety inspector reviewing CCTV footage. "
+    "Classify as SAFE or UNSAFE. If UNSAFE, add a brief reason after a colon in one short phrase (e.g. UNSAFE: person in restricted area). "
+    "If SAFE, reply with only SAFE."
+)
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -411,6 +416,57 @@ def predict_from_image(model, processor, img: Image.Image, device) -> str:
         clean_up_tokenization_spaces=False,
     )
     return normalize_pred(gen[0] if gen else "")
+
+
+def _parse_pred_and_reason(raw: str) -> tuple[str, str]:
+    """Parse model output into (SAFE|UNSAFE, reason). Reason is non-empty only for UNSAFE."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ("", "")
+    upper = raw.upper()
+    if "UNSAFE" in upper:
+        # e.g. "UNSAFE: forklift overload" or "Unsafe - person running"
+        for sep in (":", "-", "—", "."):
+            if sep in raw:
+                parts = raw.split(sep, 1)
+                if len(parts) == 2 and "UNSAFE" in parts[0].upper():
+                    return ("UNSAFE", parts[1].strip()[:80])
+        return ("UNSAFE", raw.replace("UNSAFE", "").strip()[:80] or "unsafe behavior")
+    if "SAFE" in upper:
+        return ("SAFE", "")
+    return (normalize_pred(raw), "")
+
+
+def predict_from_image_with_reason(model, processor, img: Image.Image, device) -> tuple[str, str]:
+    """Run inference and return (SAFE|UNSAFE, reason). Reason is one short phrase for UNSAFE."""
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": img},
+                {"type": "text", "text": PROMPT_WITH_REASON},
+            ],
+        }
+    ]
+    inp = processor.apply_chat_template(
+        [messages],
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    inp = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in inp.items()}
+    with torch.no_grad():
+        out = model.generate(**inp, max_new_tokens=60, do_sample=False)
+    gen = processor.batch_decode(
+        out[:, inp["input_ids"].shape[1] :],
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    raw = gen[0] if gen else ""
+    return _parse_pred_and_reason(raw)
 
 
 def predict_one(model, processor, image_path: Path, device) -> str:
