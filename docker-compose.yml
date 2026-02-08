@@ -3,8 +3,8 @@ services:
     build: .
     container_name: vlm_safe_unsafe
     working_dir: /workspace
-    # Run only video inference on 8082 (model loaded once at startup). No service on 8081.
-    command: ["python", "src/serve_video_inference.py", "--checkpoint", "/workspace/outputs/checkpoint-990"]
+    # Run video inference on 8082 (model loaded once at startup).
+    command: ["python", "src/serve_video_inference.py", "--checkpoint", "/workspace/outputs/checkpoint-2056", "--port", "8082"]
     volumes:
       - ./data:/workspace/data:rw
       - ./src:/workspace/src:rw
@@ -30,12 +30,12 @@ services:
               count: all
               capabilities: [gpu]
 
-  # Inference on test data with checkpoint 2056, progress in browser on port 8081
-  inference:
+  # YouTube inference: embed video, run inference (no download), checkpoint 2056
+  youtube:
     build: .
-    container_name: vlm_inference
+    container_name: vlm_youtube
     working_dir: /workspace
-    command: ["python", "src/serve_video_inference.py", "--checkpoint", "/workspace/outputs/checkpoint-2056", "--port", "8081"]
+    command: ["python", "src/serve_youtube_inference.py", "--checkpoint", "/workspace/outputs/checkpoint-2056", "--port", "8083"]
     volumes:
       - ./data:/workspace/data:rw
       - ./src:/workspace/src:rw
@@ -51,7 +51,7 @@ services:
     stdin_open: true
     tty: true
     ports:
-      - "8081:8081"
+      - "8083:8083"
     deploy:
       resources:
         reservations:
