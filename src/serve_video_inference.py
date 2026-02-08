@@ -27,6 +27,7 @@ from serve_inference import (
     load_model,
     predict_one,
     predict_from_image,
+    predict_from_image_with_reason,
 )
 
 # Actual test .mp4 location (allow spaces in path)
@@ -116,13 +117,14 @@ def infer_one_video_from_frames(model, processor, device, video_path: Path, grou
     votes = {"SAFE": 0, "UNSAFE": 0}
     frame_distribution = []
     for frame_index, time_sec, img in frames:
-        pred = predict_from_image(model, processor, img, device)
+        pred, reason = predict_from_image_with_reason(model, processor, img, device)
         if pred in ("SAFE", "UNSAFE"):
             votes[pred] = votes.get(pred, 0) + 1
         frame_distribution.append({
             "frame_index": frame_index,
             "time_sec": time_sec,
             "prediction": pred,
+            "reason": reason or "",
         })
     if votes["UNSAFE"] >= votes["SAFE"]:
         prediction = "UNSAFE"
