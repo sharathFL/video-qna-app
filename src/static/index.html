@@ -36,6 +36,20 @@
     <div id="frameDist"></div>
     <details><summary>Frame list</summary><div class="frame-list" id="frameList"></div></details>
   </div>
+  <section class="full-test" aria-label="Full test set">
+    <h2>Run full test set</h2>
+    <p>Run inference on all test videos (checkpoint 2056). Progress is shown below; metrics appear when done.</p>
+    <button type="button" id="runFullTestBtn">Run full test</button>
+    <div id="fullTestProgress" class="progress-wrap hidden">
+      <p id="fullTestStatus">—</p>
+      <div class="progress-bar"><div class="progress-fill" id="fullTestProgressFill"></div></div>
+    </div>
+    <div id="fullTestMetrics" class="metrics-wrap hidden">
+      <h3>Test metrics</h3>
+      <p><strong>Accuracy:</strong> <span id="metricAccuracy">—</span>%</p>
+      <p><strong>Correct:</strong> <span id="metricCorrect">—</span> / <span id="metricTotal">—</span></p>
+    </div>
+  </section>
   <div class="links">
     <a href="/test-videos?max=5">Batch: 5 test videos (JSONL)</a>
     <a href="/info">API info</a>

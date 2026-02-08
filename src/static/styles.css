@@ -215,3 +215,75 @@ a {
   font-size: 22px;
   padding: 10px 20px;
 }
+
+/* Full test section */
+.full-test {
+  margin-top: 28px;
+  padding: 20px;
+  background: #16213e;
+  border-radius: 12px;
+}
+
+.full-test h2 {
+  margin-top: 0;
+  color: #e94560;
+}
+
+.full-test button {
+  padding: 10px 20px;
+  font-size: 14px;
+  background: #e94560;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.full-test button:hover:not(:disabled) {
+  background: #ff6b6b;
+}
+
+.full-test button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.progress-wrap {
+  margin-top: 12px;
+}
+
+.progress-wrap p {
+  margin: 0 0 8px 0;
+  color: #b0b0b0;
+}
+
+.progress-bar {
+  height: 20px;
+  background: #0f0f1a;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: #e94560;
+  border-radius: 8px;
+  width: 0%;
+  transition: width 0.2s ease;
+}
+
+.metrics-wrap {
+  margin-top: 16px;
+  padding: 16px;
+  background: #0f0f1a;
+  border-radius: 8px;
+}
+
+.metrics-wrap h3 {
+  margin-top: 0;
+  color: #e94560;
+}

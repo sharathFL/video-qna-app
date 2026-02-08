@@ -9,6 +9,7 @@ Uses checkpoint-990 by default. Serves on port 8082.
 
 import argparse
 import json
+import threading
 from pathlib import Path
 from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -38,8 +39,8 @@ if not TEST_VIDEOS_ROOT.exists():
 # Folder prefix -> SAFE/UNSAFE (0-3 UNSAFE, 4-7 SAFE)
 UNSAFE_PREFIXES = ("0_", "1_", "2_", "3_")
 
-DEFAULT_PORT = 8082
-DEFAULT_CHECKPOINT = "checkpoint-990"
+DEFAULT_PORT = 8081
+DEFAULT_CHECKPOINT = "checkpoint-2056"
 
 # Static files for the UI (edit look/feel in src/static/)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -178,10 +179,11 @@ def group_test_jsonl_by_video(test_jsonl_path: Path):
     return out
 
 
-def run_video_inference(model, processor, device, video_list, frames_root: Path):
+def run_video_inference(model, processor, device, video_list, frames_root: Path, progress_callback=None):
     """Run inference on each frame of each video; return prediction per video by max-vote."""
     results = []
-    for v in video_list:
+    total = len(video_list)
+    for i, v in enumerate(video_list):
         video_id = v["video_id"]
         frame_paths = v["frames"]
         ground_truth = v["ground_truth"]
@@ -198,25 +200,28 @@ def run_video_inference(model, processor, device, video_list, frames_root: Path)
             prediction = "UNSAFE"
         else:
             prediction = "SAFE"
-        results.append({
+        result = {
             "video_id": video_id,
             "ground_truth": ground_truth,
             "prediction": prediction,
             "frame_votes": votes,
             "frame_predictions": frame_predictions,
             "correct": prediction == ground_truth,
-        })
+        }
+        results.append(result)
+        if progress_callback:
+            progress_callback(i + 1, total, result)
     return results
 
 
-def get_video_results(model, processor, device, max_videos=None):
+def get_video_results(model, processor, device, max_videos=None, progress_callback=None):
     """Load test videos from test.jsonl, run video inference, return results."""
     videos = group_test_jsonl_by_video(TEST_JSONL)
     if max_videos is not None:
         videos = videos[:max_videos]
     if not videos:
         return {"error": "No test videos", "results": [], "correct": 0, "total": 0, "accuracy": 0.0}
-    results = run_video_inference(model, processor, device, videos, FRAMES_ROOT)
+    results = run_video_inference(model, processor, device, videos, FRAMES_ROOT, progress_callback=progress_callback)
     correct = sum(1 for r in results if r["correct"])
     total = len(results)
     acc = (correct / total * 100.0) if total else 0.0
@@ -226,6 +231,17 @@ def get_video_results(model, processor, device, max_videos=None):
         "total": total,
         "accuracy": round(acc, 2),
     }
+
+
+# Shared state for full test run (progress + final metrics)
+_test_state = {
+    "in_progress": False,
+    "current": 0,
+    "total": 0,
+    "results": None,
+    "error": None,
+}
+_test_state_lock = threading.Lock()
 
 
 class VideoInferenceHandler(BaseHTTPRequestHandler):
@@ -367,6 +383,64 @@ class VideoInferenceHandler(BaseHTTPRequestHandler):
             )
             self.send_json(out)
             return
+        if path == "/run-test":
+            if self.server.model is None:
+                self.send_json({"error": "Model not loaded"}, status=503)
+                return
+            with _test_state_lock:
+                if _test_state["in_progress"]:
+                    self.send_json({"error": "Test already in progress", "current": _test_state["current"], "total": _test_state["total"]}, status=409)
+                    return
+                _test_state["in_progress"] = True
+                _test_state["current"] = 0
+                _test_state["total"] = 0
+                _test_state["results"] = None
+                _test_state["error"] = None
+
+            def run_full_test():
+                try:
+                    def progress_cb(current, total, last_result):
+                        with _test_state_lock:
+                            _test_state["current"] = current
+                            _test_state["total"] = total
+                    out = get_video_results(
+                        self.server.model,
+                        self.server.processor,
+                        self.server.device,
+                        max_videos=None,
+                        progress_callback=progress_cb,
+                    )
+                    with _test_state_lock:
+                        _test_state["results"] = out
+                        _test_state["in_progress"] = False
+                except Exception as e:
+                    with _test_state_lock:
+                        _test_state["error"] = str(e)
+                        _test_state["in_progress"] = False
+
+            t = threading.Thread(target=run_full_test, daemon=True)
+            t.start()
+            self.send_json({"status": "started", "message": "Full test running. Poll /test-status for progress."})
+            return
+        if path == "/test-status":
+            with _test_state_lock:
+                state = {
+                    "in_progress": _test_state["in_progress"],
+                    "current": _test_state["current"],
+                    "total": _test_state["total"],
+                }
+                if _test_state["error"]:
+                    state["error"] = _test_state["error"]
+                if _test_state["results"] is not None:
+                    state["done"] = True
+                    state["correct"] = _test_state["results"].get("correct", 0)
+                    state["total"] = _test_state["results"].get("total", 0)
+                    state["accuracy"] = _test_state["results"].get("accuracy", 0.0)
+                    state["results"] = _test_state["results"].get("results", [])
+                else:
+                    state["done"] = False
+            self.send_json(state)
+            return
         if path == "/info":
             self.send_json({
                 "service": "SmolVLM2 Safe/Unsafe — Video inference (max-vote)",
@@ -378,6 +452,8 @@ class VideoInferenceHandler(BaseHTTPRequestHandler):
                     "GET /videos": "List .mp4 test videos (path, label, folder).",
                     "GET /infer-video?path=...": "Infer one .mp4: extract frames, per-frame prediction, max-vote. path = e.g. 4_safe_walkway/4_te1.mp4",
                     "GET /test-videos": "Run on pre-extracted test.jsonl videos. Query: ?max=N.",
+                    "GET /run-test": "Start full test set inference in background. Poll /test-status for progress.",
+                    "GET /test-status": "Progress and final metrics (in_progress, current, total, done, correct, accuracy, results).",
                 },
             })
             return
