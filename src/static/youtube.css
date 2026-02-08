@@ -1,0 +1,260 @@
+/* YouTube inference page */
+
+/* Loading overlay: shown until model is loaded */
+.load-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: #1a1a2e;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 9999;
+}
+
+.load-overlay.hidden {
+  display: none !important;
+}
+
+.load-title {
+  color: #e94560;
+  margin: 0 0 12px 0;
+}
+
+.load-message {
+  color: #b0b0b0;
+  margin: 0 0 8px 0;
+}
+
+.load-pct {
+  font-size: 1.5rem;
+  font-weight: bold;
+  color: #e94560;
+  margin: 0 0 12px 0;
+}
+
+.load-progress-bar {
+  width: 100%;
+  max-width: 400px;
+  height: 20px;
+  background: #0f0f1a;
+  border-radius: 8px;
+  overflow: hidden;
+  margin-bottom: 24px;
+}
+
+.load-progress-fill {
+  height: 100%;
+  background: #e94560;
+  border-radius: 8px;
+  width: 0%;
+  transition: width 0.2s ease;
+}
+
+.load-stats {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px 24px;
+  text-align: left;
+  background: #16213e;
+  padding: 16px 24px;
+  border-radius: 12px;
+  min-width: 280px;
+}
+
+.load-stats .stat-row {
+  display: contents;
+}
+
+.load-stats .stat-label {
+  color: #888;
+}
+
+.load-stats .stat-value {
+  color: #eee;
+  font-family: ui-monospace, monospace;
+}
+
+.load-error {
+  color: #ff6b6b;
+  margin-top: 16px;
+  max-width: 400px;
+  text-align: center;
+}
+
+.main-content.hidden {
+  display: none !important;
+}
+
+.subtitle {
+  color: #a0a0a0;
+  margin-bottom: 20px;
+}
+
+.youtube-input {
+  margin-bottom: 24px;
+  padding: 20px;
+  background: #16213e;
+  border-radius: 12px;
+}
+
+.youtube-input label {
+  display: block;
+  margin-bottom: 8px;
+  color: #b0b0b0;
+}
+
+.youtube-input input[type="url"] {
+  width: 100%;
+  max-width: 560px;
+  padding: 10px 12px;
+  font-size: 14px;
+  background: #0f0f1a;
+  color: #eee;
+  border: 1px solid #333;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+
+.youtube-input .button-row {
+  margin-top: 12px;
+  display: flex;
+  gap: 12px;
+}
+
+.youtube-input button {
+  padding: 10px 20px;
+  font-size: 14px;
+  background: #e94560;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.youtube-input button:hover:not(:disabled) {
+  background: #ff6b6b;
+}
+
+.youtube-input button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.embed-section {
+  margin-bottom: 24px;
+}
+
+.embed-section h2 {
+  color: #e94560;
+  margin-top: 0;
+}
+
+.embed-wrap {
+  position: relative;
+  max-width: 100%;
+  background: #000;
+  border-radius: 8px;
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+}
+
+.embed-placeholder {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  margin: 0;
+  color: #606080;
+  text-align: center;
+  pointer-events: none;
+}
+
+.embed-wrap.has-embed .embed-placeholder {
+  display: none;
+}
+
+.yt-iframe {
+  display: none;
+  width: 100%;
+  height: 100%;
+  border: none;
+}
+
+.embed-wrap.has-embed .yt-iframe {
+  display: block;
+}
+
+.result-section {
+  padding: 20px;
+  background: #0f0f1a;
+  border-radius: 12px;
+}
+
+.result-section h2 {
+  color: #e94560;
+  margin-top: 0;
+}
+
+.result-status {
+  color: #b0b0b0;
+  margin: 0 0 12px 0;
+}
+
+.result-content.hidden {
+  display: none !important;
+}
+
+.result-content .badge.SAFE {
+  background: #2e7d32;
+  color: #c8e6c9;
+  padding: 4px 12px;
+  border-radius: 6px;
+}
+
+.result-content .badge.UNSAFE {
+  background: #c62828;
+  color: #ffcdd2;
+  padding: 4px 12px;
+  border-radius: 6px;
+}
+
+.result-content .SAFE,
+.result-content .UNSAFE {
+  padding: 4px 10px;
+  border-radius: 4px;
+  margin-right: 8px;
+}
+
+.result-content .frame-list {
+  max-height: 200px;
+  overflow-y: auto;
+  font-size: 12px;
+  font-family: monospace;
+}
+
+.result-content .frame-list div {
+  padding: 2px 0;
+}
+
+#frameDist .frame {
+  width: 12px;
+  height: 20px;
+  border-radius: 2px;
+}
+
+#frameDist .frame.SAFE {
+  background: #2e7d32;
+}
+
+#frameDist .frame.UNSAFE {
+  background: #c62828;
+}
+
+#frameDist .frame.other {
+  background: #555;
+}

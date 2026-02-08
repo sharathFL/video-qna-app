@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>YouTube — Safe/Unsafe inference</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/youtube.css">
+</head>
+<body>
+  <div id="loadOverlay" class="load-overlay">
+    <h2 class="load-title">Loading model</h2>
+    <p class="load-message" id="loadMessage">Starting…</p>
+    <p class="load-pct" id="loadPct">0%</p>
+    <div class="load-progress-bar"><div class="load-progress-fill" id="loadProgressFill"></div></div>
+    <div class="load-stats" id="loadStats">
+      <div class="stat-row"><span class="stat-label">GPU</span><span id="statGpu" class="stat-value">—</span></div>
+      <div class="stat-row"><span class="stat-label">GPU memory</span><span id="statGpuMem" class="stat-value">—</span></div>
+      <div class="stat-row"><span class="stat-label">CPU</span><span id="statCpu" class="stat-value">—</span></div>
+      <div class="stat-row"><span class="stat-label">RAM</span><span id="statRam" class="stat-value">—</span></div>
+    </div>
+    <p id="loadError" class="load-error hidden"></p>
+  </div>
+
+  <div id="mainContent" class="main-content hidden">
+  <h1>YouTube — Safe/Unsafe inference</h1>
+  <p class="subtitle">Paste a YouTube URL. The video is embedded below; inference runs in the cloud (no download). Checkpoint 2056.</p>
+
+  <section class="youtube-input">
+    <label for="ytUrl">YouTube URL</label>
+    <input type="url" id="ytUrl" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off">
+    <div class="button-row">
+      <button type="button" id="embedBtn">Embed video</button>
+      <button type="button" id="runInferBtn">Run inference</button>
+    </div>
+  </section>
+
+  <section class="embed-section">
+    <h2>Video</h2>
+    <div class="embed-wrap" id="embedWrap">
+      <p class="embed-placeholder" id="embedPlaceholder">Enter a URL and click “Embed video” to load the player.</p>
+      <iframe id="ytEmbed" class="yt-iframe" title="YouTube video" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+    </div>
+  </section>
+
+  <section class="result-section" id="resultSection">
+    <h2>Result</h2>
+    <p id="resultStatus" class="result-status">—</p>
+    <div id="resultContent" class="result-content hidden">
+      <p><strong>Prediction:</strong> <span id="resPred" class="badge">—</span></p>
+      <p><strong>Frame votes:</strong> <span id="voteSAFE" class="SAFE">SAFE: 0</span> <span id="voteUNSAFE" class="UNSAFE">UNSAFE: 0</span></p>
+      <p><strong>Frames analyzed:</strong> <span id="totalFrames">0</span></p>
+      <div class="dist-label">Frame-wise (each block = one frame)</div>
+      <div id="frameDist"></div>
+      <details><summary>Frame list</summary><div class="frame-list" id="frameList"></div></details>
+    </div>
+  </section>
+
+  <div class="links">
+    <a href="/info">API info</a>
+  </div>
+  </div>
+  <script src="/static/youtube.js"></script>
+</body>
+</html>

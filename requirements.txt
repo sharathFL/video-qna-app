@@ -14,3 +14,4 @@ matplotlib
 qwen-vl-utils
 num2words
 psutil
+yt-dlp>=2024.1.0
