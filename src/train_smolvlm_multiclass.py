@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Train SmolVLM2 (small VLM) for SAFE/UNSAFE classification.
-Uses same data as train_vlm.py. Much smaller and faster than Qwen2-VL-7B.
+Train SmolVLM2 (small VLM) for multiclass behavior labeling (8 classes).
+Uses data/frames_multiclass and data/train_multiclass.jsonl.
+All outputs (models, logs, plots) go to outputs_multiclass/ so binary outputs/ stays separate.
 Requires: transformers>=4.49.0 (for SmolVLM2 support).
 """
 
@@ -34,24 +35,24 @@ except Exception:
     HAS_MATPLOTLIB = False
     plt = None
 
-# Paths (same as train_vlm.py)
-FRAMES_ROOT = Path("/workspace/data/frames")
-TRAIN_JSONL = Path("/workspace/data/train.jsonl")
-OUTPUT_DIR = Path("/workspace/outputs")
-PLOTS_DIR = Path("/workspace/outputs/plots")
+# Multiclass paths (separate from binary safe/unsafe)
+FRAMES_ROOT = Path("/workspace/data/frames_multiclass")
+TRAIN_JSONL = Path("/workspace/data/train_multiclass.jsonl")
+OUTPUT_DIR = Path("/workspace/outputs_multiclass")
+PLOTS_DIR = Path("/workspace/outputs_multiclass/plots")
 
 # SmolVLM2 variants (smaller = faster, less VRAM)
 SMOLVLM2_2B = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
 SMOLVLM2_500M = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
 SMOLVLM2_256M = "HuggingFaceTB/SmolVLM2-256M-Video-Instruct"
 
-PROMPT = "You are a workplace safety inspector reviewing CCTV footage. Classify the behavior as SAFE or UNSAFE. Answer with only one word."
+PROMPT = ""  # Multiclass: prompt comes from dataset (build_jsonl_multiclass); fallback only
 EPOCHS = 2
 BATCH_SIZE = 2
 LR = 2e-4
 GRAD_ACCUM = 4
-RESPONSE_LABEL_TOKENS = 8
-LIVE_DASHBOARD_PORT = 8080
+RESPONSE_LABEL_TOKENS = 24  # Longer for class names like 3_carrying_overload_with_forklift
+LIVE_DASHBOARD_PORT = 8081  # Different port so binary (8080) and multiclass can run side by side
 PLOT_UPDATE_EVERY_N_STEPS = 20  # update sample predictions every N steps (loss still every log step)
 
 
@@ -207,7 +208,7 @@ def _gather_system_stats():
 
 # Dashboard HTML with Plotly.js: loss and accuracy side by side; stats loaded separately; checkpoint alert.
 _INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>SmolVLM2 Training</title>
+<html><head><meta charset="utf-8"><title>SmolVLM2 — Multiclass (8 classes)</title>
 <meta http-equiv="refresh" content="30"/>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <style>
@@ -226,8 +227,8 @@ th {{ background: #16213e; }} a {{ color: #e94560; }}
 @keyframes pulse {{ 0%,100% {{ opacity: 1; transform: scale(1); }} 50% {{ opacity: 0.9; transform: scale(1.01); }} }}
 #url-hint {{ background: #2e7d32; color: #fff; padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; }}
 </style></head><body>
-<p id="url-hint"><strong>Dashboard:</strong> Open at <a href="http://localhost:8080/" style="color:#fff; text-decoration:underline">http://localhost:8080/</a> in your browser (do not open the HTML file directly).</p>
-<h1>SmolVLM2 — Live Training</h1>
+<p id="url-hint"><strong>Multiclass dashboard:</strong> Open at <a href="http://localhost:8081/" style="color:#fff; text-decoration:underline">http://localhost:8081/</a> in your browser (do not open the HTML file directly).</p>
+<h1>SmolVLM2 — Multiclass (8 classes) — Live Training</h1>
 <p>Step: <b>{step}</b> {progress} | {message} | <em>Auto-refresh 30s</em></p>
 <div id="checkpoint-alert"></div>
 <div class="section"><h2>System &amp; training stats</h2><div id="stats">Loading...</div></div>
@@ -236,7 +237,7 @@ th {{ background: #16213e; }} a {{ color: #e94560; }}
   <div class="plot-container"><h3>Training loss</h3><div id="loss-plot" class="plot"></div></div>
   <div class="plot-container"><h3>Training accuracy (sample)</h3><div id="accuracy-plot" class="plot"></div></div>
 </div></div>
-<div class="section"><h2>Sample inputs &amp; predictions (5 frames, rotating across dataset each update)</h2>
+<div class="section"><h2>Sample inputs &amp; predictions (5 random frames each update)</h2>
 <p style="color:#888; font-size:0.9em;">Refresh every <b>{update_every_n}</b> steps (use <code>--plot-every N</code> to change; page auto-refreshes every 30s)</p>
 <table><tr><th>Input frame</th><th>Ground truth</th><th>Prediction</th><th>Step</th><th>Idx</th></tr>
 {rows}
@@ -246,7 +247,7 @@ th {{ background: #16213e; }} a {{ color: #e94560; }}
 <script>
 (function() {{
   if (window.location.protocol === 'file:') {{
-    document.body.insertAdjacentHTML('afterbegin', '<div style="background:#c62828;color:#fff;padding:16px;margin-bottom:16px;border-radius:8px;"><strong>Wrong URL.</strong> You opened this as a file. Open <a href="http://localhost:8080/" style="color:#fff; text-decoration:underline">http://localhost:8080/</a> in your browser instead (training server must be running).</div>');
+    document.body.insertAdjacentHTML('afterbegin', '<div style="background:#c62828;color:#fff;padding:16px;margin-bottom:16px;border-radius:8px;"><strong>Wrong URL.</strong> You opened this as a file. Open <a href="http://localhost:8081/" style="color:#fff; text-decoration:underline">http://localhost:8081/</a> in your browser instead (training server must be running).</div>');
     var h = document.getElementById('url-hint');
     if (h) h.style.display = 'none';
   }} else {{
@@ -454,7 +455,7 @@ class LiveDashboardCallback(TrainerCallback):
         # Always write index with current displayed_step so header shows 990 (not 0) when resuming
         self._write_index(step=displayed_step, message="Training started." + (" Resumed." if (self.log_steps or self.sample_accuracy_steps) else " Refresh in a few steps."))
         self._write_training_state(displayed_step)
-        print(f"  Dashboard: loss every log step, predictions every {self.update_every_n} steps (5 samples spread across dataset, rotating each update)")
+        print(f"  Dashboard: loss every log step, predictions every {self.update_every_n} steps (5 random samples each update)")
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
         if self.model_ref is None and model is not None:
@@ -535,7 +536,7 @@ class LiveDashboardCallback(TrainerCallback):
             return
         if not HAS_MATPLOTLIB:
             return
-        # Multiclass: 5 random indices each update; binary: 5 spread indices rotating by step
+        # Multiclass: 5 random indices each update for class variety
         dataset_len = len(self.dataset)
         if dataset_len == 0:
             return
@@ -690,7 +691,7 @@ class LiveDashboardCallback(TrainerCallback):
 
 
 class SafetyDatasetSmolVLM(Dataset):
-    """Dataset for SmolVLM2: one image + prompt -> SAFE/UNSAFE."""
+    """Dataset for SmolVLM2: one image + prompt -> class name (8 classes)."""
 
     def __init__(self, jsonl_path, frames_root, processor):
         self.frames_root = Path(frames_root)
@@ -809,7 +810,7 @@ def main():
         encoding="utf-8",
     )
     print(f"Live dashboard: http://localhost:{LIVE_DASHBOARD_PORT}/")
-    print("  -> Open this URL in your browser (not the index.html file). If you're on another machine, use http://<this-host-ip>:8080/")
+    print("  -> Open this URL in your browser (not the index.html file). If you're on another machine, use http://<this-host-ip>:8081/")
 
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -840,6 +841,9 @@ def main():
     model.print_trainable_parameters()
 
     dataset = SafetyDatasetSmolVLM(TRAIN_JSONL, FRAMES_ROOT, processor)
+    class_names = sorted(set(s["response"] for s in dataset.samples))
+    prompt_override = dataset.samples[0]["prompt"] if dataset.samples else ""
+    print(f"Multiclass labels ({len(class_names)}): {class_names}")
     print("Training data is shuffled each epoch (Trainer default).")
     dashboard_callback = LiveDashboardCallback(
         PLOTS_DIR,
@@ -850,6 +854,8 @@ def main():
         training_output_dir=OUTPUT_DIR,
         model=model,
         resuming=resuming,
+        prompt_override=prompt_override,
+        valid_responses=class_names,
     )
     training_args = TrainingArguments(
         output_dir=str(OUTPUT_DIR),
