@@ -21,6 +21,7 @@ const frameDist = document.getElementById('frameDist');
 const frameList = document.getElementById('frameList');
 
 let lastFrameDistribution = [];
+let lastGroundTruth = null;
 
 function getFrameAtTime(timeSec) {
   if (!lastFrameDistribution.length) return null;
@@ -42,7 +43,8 @@ function frameLabel(f) {
 function setOverlayForFrame(overlayPredEl, currentFrameLabelEl, f) {
   const pred = f ? (f.prediction || '—') : '—';
   overlayPredEl.textContent = pred;
-  overlayPredEl.className = 'badge frame-pred ' + (pred === 'SAFE' ? 'SAFE' : pred === 'UNSAFE' ? 'UNSAFE' : '');
+  var correct = lastGroundTruth != null && pred === lastGroundTruth;
+  overlayPredEl.className = 'badge frame-pred ' + (correct ? 'badge-pred-correct' : 'badge-pred-wrong');
   currentFrameLabelEl.textContent = frameLabel(f);
 }
 
@@ -168,34 +170,52 @@ runBtn.addEventListener('click', function () {
       }
       result.classList.add('show');
       lastFrameDistribution = data.frame_distribution || [];
+      lastGroundTruth = data.ground_truth || null;
       resPath.textContent = data.video_path || path;
       resGT.textContent = data.ground_truth || '-';
       resPred.textContent = data.prediction || '-';
-      resPred.className = (data.prediction === 'SAFE') ? 'SAFE' : 'UNSAFE';
+      resPred.className = (data.prediction === 'SAFE') ? 'SAFE' : (data.prediction === 'UNSAFE') ? 'UNSAFE' : 'other';
       resCorrect.textContent = data.correct !== undefined ? (data.correct ? ' ✓' : ' ✗') : '';
-      voteSAFE.textContent = 'SAFE: ' + (data.frame_votes && data.frame_votes.SAFE != null ? data.frame_votes.SAFE : 0);
-      voteUNSAFE.textContent = 'UNSAFE: ' + (data.frame_votes && data.frame_votes.UNSAFE != null ? data.frame_votes.UNSAFE : 0);
+      if (data.multiclass && data.frame_votes && Object.keys(data.frame_votes).length > 2) {
+        var parts = Object.entries(data.frame_votes).filter(function (e) { return e[1] > 0; }).map(function (e) { return e[0] + ': ' + e[1]; });
+        voteSAFE.textContent = 'Votes: ' + (parts.length ? parts.join(' | ') : '—');
+        voteUNSAFE.textContent = '';
+      } else {
+        voteSAFE.textContent = 'SAFE: ' + (data.frame_votes && data.frame_votes.SAFE != null ? data.frame_votes.SAFE : 0);
+        voteUNSAFE.textContent = 'UNSAFE: ' + (data.frame_votes && data.frame_votes.UNSAFE != null ? data.frame_votes.UNSAFE : 0);
+      }
 
       frameDist.innerHTML = '';
       lastFrameDistribution.forEach(function (f) {
         const span = document.createElement('span');
-        span.className = 'frame ' + (f.prediction === 'SAFE' || f.prediction === 'UNSAFE' ? f.prediction : 'other');
+        span.className = 'frame ' + (f.prediction === 'SAFE' ? 'SAFE' : f.prediction === 'UNSAFE' ? 'UNSAFE' : 'other');
         span.title = frameLabel(f);
         frameDist.appendChild(span);
       });
       frameList.innerHTML = '';
       lastFrameDistribution.forEach(function (f) {
         const div = document.createElement('div');
-        div.textContent = frameLabel(f);
+        div.className = 'frame-item';
+        const predLine = document.createElement('div');
+        predLine.className = 'frame-pred-text';
+        predLine.textContent = 'Frame ' + f.frame_index + ' (' + f.time_sec + 's): ' + (f.prediction || '—');
+        div.appendChild(predLine);
+        if (f.reason && f.reason.trim()) {
+          const reasonLine = document.createElement('div');
+          reasonLine.className = 'frame-reason';
+          reasonLine.textContent = f.reason.trim();
+          div.appendChild(reasonLine);
+        }
         frameList.appendChild(div);
       });
 
       videoContainer.style.display = 'inline-block';
       resultVideo.src = '/video?path=' + encodeURIComponent(data.video_path || path);
       overlayGT.textContent = 'GT: ' + (data.ground_truth || '—');
-      overlayGT.className = 'badge ' + (data.ground_truth === 'SAFE' ? 'SAFE' : 'UNSAFE');
+      overlayGT.className = 'badge badge-gt';
       var overlayVideoPred = document.getElementById('overlayVideoPred');
       overlayVideoPred.textContent = 'Video: ' + (data.prediction || '—');
+      overlayVideoPred.className = 'badge final-badge ' + (data.correct ? 'badge-pred-correct' : 'badge-pred-wrong');
       setOverlayForFrame(overlayPred, currentFrameLabel, lastFrameDistribution[0] || null);
       resultVideo.ontimeupdate = function () {
         var t = Math.floor(resultVideo.currentTime);

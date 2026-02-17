@@ -130,6 +130,25 @@ a {
   padding: 2px 0;
 }
 
+.frame-list .frame-item {
+  padding: 6px 8px;
+  margin-bottom: 4px;
+  border-radius: 4px;
+  border-left: 3px solid #333;
+}
+
+.frame-list .frame-item .frame-pred-text {
+  font-weight: 600;
+}
+
+.frame-list .frame-reason {
+  font-size: 11px;
+  color: #9e9e9e;
+  margin-top: 2px;
+  padding-left: 4px;
+  font-style: italic;
+}
+
 .links {
   margin-top: 20px;
 }
@@ -192,6 +211,23 @@ a {
 .video-overlay .badge.UNSAFE {
   background: rgba(198, 40, 40, 0.9);
   color: #ffcdd2;
+}
+
+/* GT overlay: always highlighted (e.g. blue) */
+.video-overlay .badge.badge-gt {
+  background: rgba(21, 101, 192, 0.95);
+  color: #bbdefb;
+}
+
+/* Video-level prediction: green when correct, amber when wrong */
+.video-overlay .badge.badge-pred-correct {
+  background: rgba(46, 125, 50, 0.95);
+  color: #c8e6c9;
+}
+
+.video-overlay .badge.badge-pred-wrong {
+  background: rgba(230, 81, 0, 0.95);
+  color: #ffe0b2;
 }
 
 .video-overlay .final-badge {

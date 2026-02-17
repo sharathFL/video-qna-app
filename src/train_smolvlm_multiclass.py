@@ -52,7 +52,7 @@ BATCH_SIZE = 2
 LR = 2e-4
 GRAD_ACCUM = 4
 RESPONSE_LABEL_TOKENS = 24  # Longer for class names like 3_carrying_overload_with_forklift
-LIVE_DASHBOARD_PORT = 8081  # Different port so binary (8080) and multiclass can run side by side
+LIVE_DASHBOARD_PORT = 8084  # Multiclass training dashboard
 PLOT_UPDATE_EVERY_N_STEPS = 20  # update sample predictions every N steps (loss still every log step)
 
 
@@ -227,7 +227,7 @@ th {{ background: #16213e; }} a {{ color: #e94560; }}
 @keyframes pulse {{ 0%,100% {{ opacity: 1; transform: scale(1); }} 50% {{ opacity: 0.9; transform: scale(1.01); }} }}
 #url-hint {{ background: #2e7d32; color: #fff; padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; }}
 </style></head><body>
-<p id="url-hint"><strong>Multiclass dashboard:</strong> Open at <a href="http://localhost:8081/" style="color:#fff; text-decoration:underline">http://localhost:8081/</a> in your browser (do not open the HTML file directly).</p>
+<p id="url-hint"><strong>Multiclass dashboard:</strong> Open at <a href="http://localhost:8084/" style="color:#fff; text-decoration:underline">http://localhost:8084/</a> in your browser (do not open the HTML file directly).</p>
 <h1>SmolVLM2 — Multiclass (8 classes) — Live Training</h1>
 <p>Step: <b>{step}</b> {progress} | {message} | <em>Auto-refresh 30s</em></p>
 <div id="checkpoint-alert"></div>
@@ -247,7 +247,7 @@ th {{ background: #16213e; }} a {{ color: #e94560; }}
 <script>
 (function() {{
   if (window.location.protocol === 'file:') {{
-    document.body.insertAdjacentHTML('afterbegin', '<div style="background:#c62828;color:#fff;padding:16px;margin-bottom:16px;border-radius:8px;"><strong>Wrong URL.</strong> You opened this as a file. Open <a href="http://localhost:8081/" style="color:#fff; text-decoration:underline">http://localhost:8081/</a> in your browser instead (training server must be running).</div>');
+    document.body.insertAdjacentHTML('afterbegin', '<div style="background:#c62828;color:#fff;padding:16px;margin-bottom:16px;border-radius:8px;"><strong>Wrong URL.</strong> You opened this as a file. Open <a href="http://localhost:8084/" style="color:#fff; text-decoration:underline">http://localhost:8084/</a> in your browser instead (training server must be running).</div>');
     var h = document.getElementById('url-hint');
     if (h) h.style.display = 'none';
   }} else {{
@@ -810,7 +810,7 @@ def main():
         encoding="utf-8",
     )
     print(f"Live dashboard: http://localhost:{LIVE_DASHBOARD_PORT}/")
-    print("  -> Open this URL in your browser (not the index.html file). If you're on another machine, use http://<this-host-ip>:8081/")
+    print("  -> Open this URL in your browser (not the index.html file). If you're on another machine, use http://<this-host-ip>:8084/")
 
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")

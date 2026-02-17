@@ -1,0 +1,32 @@
+# Multiclass video inference on 8086 (binary video inference stays on 8082).
+# Uses checkpoint-1266 from outputs_multiclass.
+
+services:
+  multiclass-video-inference:
+    build: .
+    container_name: vlm_multiclass_video_inference
+    working_dir: /workspace
+    command: ["python", "src/serve_video_inference_multiclass.py", "--port", "8086", "--checkpoint", "checkpoint-1266"]
+    volumes:
+      - ./data:/workspace/data:rw
+      - ./src:/workspace/src:rw
+      - ./outputs_multiclass:/workspace/outputs_multiclass:rw
+      - ./cache/hf:/workspace/.cache/huggingface:rw
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - CUDA_VISIBLE_DEVICES=0
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HF_HOME=/workspace/.cache/huggingface
+      - TRANSFORMERS_CACHE=/workspace/.cache/huggingface
+    shm_size: "2gb"
+    stdin_open: true
+    tty: true
+    ports:
+      - "8086:8086"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

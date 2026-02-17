@@ -1,0 +1,35 @@
+# Multiclass training only. Dashboard on 8085 (8084 if free).
+# Prereq: run extract_frames_multiclass.py and build_jsonl_multiclass.py (e.g. in another container or locally with same mounts).
+# Stop inference services first: docker compose down
+# Start: docker compose -f docker-compose.multiclass.yml up
+# URL: http://localhost:8085/
+
+services:
+  multiclass-training:
+    build: .
+    container_name: vlm_multiclass_training
+    working_dir: /workspace
+    command: ["python", "-u", "src/train_smolvlm_multiclass.py", "--model", "HuggingFaceTB/SmolVLM2-2.2B-Instruct"]
+    volumes:
+      - ./data:/workspace/data:rw
+      - ./src:/workspace/src:rw
+      - ./outputs_multiclass:/workspace/outputs_multiclass:rw
+      - ./cache/hf:/workspace/.cache/huggingface:rw
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - CUDA_VISIBLE_DEVICES=0
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HF_HOME=/workspace/.cache/huggingface
+      - TRANSFORMERS_CACHE=/workspace/.cache/huggingface
+    shm_size: "2gb"
+    stdin_open: true
+    tty: true
+    ports:
+      - "8085:8084"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
