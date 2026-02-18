@@ -19,6 +19,7 @@ import urllib.parse
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -131,18 +132,33 @@ MAX_NEW_TOKENS = 80
 
 
 def load_smolvlm(model_name: str, device, progress_callback=None):
+    import inspect
     from transformers import AutoProcessor, AutoModelForImageTextToText
     if progress_callback:
         progress_callback(10, "Loading processor…")
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
     if progress_callback:
         progress_callback(30, "Loading model…")
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
-        device_map=str(device) if device.type == "cuda" else None,
-        trust_remote_code=True,
-    )
+    # Load once: only pass attn_implementation if supported (avoids loading model twice on GPU on TypeError).
+    kwargs = {
+        "torch_dtype": torch.bfloat16 if device.type == "cuda" else torch.float32,
+        "device_map": str(device) if device.type == "cuda" else None,
+        "trust_remote_code": True,
+    }
+    try:
+        sig = inspect.signature(AutoModelForImageTextToText.from_pretrained)
+        if "attn_implementation" in sig.parameters:
+            kwargs["attn_implementation"] = "eager"
+    except Exception:
+        pass
+    try:
+        model = AutoModelForImageTextToText.from_pretrained(model_name, **kwargs)
+    except TypeError:
+        # Signature may have **kwargs; param exists but value not supported — clear GPU and retry without.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        model = AutoModelForImageTextToText.from_pretrained(model_name, **{k: v for k, v in kwargs.items() if k != "attn_implementation"})
+        print("Note: attn_implementation not supported; attention map unavailable.", file=sys.stderr)
     if progress_callback:
         progress_callback(100, "Ready")
     return model, processor
@@ -193,6 +209,292 @@ def ask_smolvlm(model, processor, image: Image.Image, question: str, device) -> 
         clean_up_tokenization_spaces=False,
     )
     return (gen[0] if gen else "").strip()
+
+
+# Attention map (same model as QA; SmolVLM2 only)
+ATTENTION_MAX_NEW_TOKENS = 80
+PATCH_ROWS, PATCH_COLS = 3, 4
+TOKENS_PER_PATCH = 64
+PATCH_PIXELS = 512
+IMAGE_TOKEN_COUNT = PATCH_ROWS * PATCH_COLS * TOKENS_PER_PATCH
+_last_attention_run = {"attn": None, "tokens": [], "num_layers": 0, "num_heads": 0, "answer": "", "image_base64": None}
+
+
+def run_with_attentions_smolvlm(model, processor, image: Image.Image, question: str, device):
+    """Run SmolVLM with output_attentions; return answer, tokens, attn_list, num_layers, num_heads."""
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    messages = [
+        {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": question}]},
+    ]
+    inp = processor.apply_chat_template(
+        [messages], add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt",
+    )
+    inp = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in inp.items()}
+    prompt_length = inp["input_ids"].shape[1]
+    with torch.no_grad():
+        out = model.generate(
+            **inp,
+            max_new_tokens=ATTENTION_MAX_NEW_TOKENS,
+            do_sample=False,
+            output_attentions=True,
+            return_dict_in_generate=True,
+        )
+    gen_ids = out.sequences[:, prompt_length:]
+    decoded = processor.batch_decode(gen_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+    answer = (decoded[0] if decoded else "").strip()
+    token_list = []
+    for i in range(gen_ids.shape[1]):
+        tok = processor.decode(gen_ids[0, i : i + 1], skip_special_tokens=False)
+        token_list.append(tok if tok else "<unk>")
+    if not getattr(out, "attentions", None) or not out.attentions:
+        return answer, token_list, None, 0, 0
+    num_steps = len(out.attentions)
+    num_layers = len(out.attentions[0]) if num_steps else 0
+    num_heads = out.attentions[0][0].shape[1] if num_layers else 0
+    attn_list = []
+    for step in range(num_steps):
+        layer_list = []
+        for layer in range(num_layers):
+            a = out.attentions[step][layer][0].float().cpu().numpy()
+            layer_list.append(a)
+        attn_list.append(layer_list)
+    return answer, token_list, attn_list, num_layers, num_heads
+
+
+def _weighted_mean_axis0(arr, axis=0):
+    """Weight by index (1,2,...,n) so later indices count more. arr shape (n, ...)."""
+    n = arr.shape[axis]
+    w = np.arange(1, n + 1, dtype=np.float32) / ((n * (n + 1)) / 2.0)
+    # shape so w broadcasts: (1,...,1, n, 1,...,1) with n at position axis
+    w = w.reshape((1,) * axis + (n,) + (1,) * (arr.ndim - axis - 1))
+    return (arr * w).sum(axis=axis)
+
+
+def _trimmed_mean_axis0(arr, trim_frac=0.25, axis=0):
+    """Per position: sort values along axis, drop bottom and top trim_frac, mean of middle."""
+    arr = np.asarray(arr, dtype=np.float32)
+    sorted_arr = np.sort(arr, axis=axis)
+    n = arr.shape[axis]
+    drop = max(0, int(n * trim_frac))
+    if drop * 2 >= n:
+        return sorted_arr.take(n // 2, axis=axis)
+    sl = [slice(None)] * arr.ndim
+    sl[axis] = slice(drop, n - drop)
+    return sorted_arr[tuple(sl)].mean(axis=axis)
+
+
+def attention_to_heatmap(attn_list, token_idx, layer_idx, head_idx, image_token_count, threshold=0.0):
+    # layer_idx/head_idx: -3 trimmed mean, -2 weighted mean, -1 simple mean, >=0 single layer/head
+    if token_idx >= len(attn_list):
+        return None
+    num_layers = len(attn_list[0])
+    if num_layers == 0 or layer_idx >= num_layers:
+        return None
+    layer_agg = layer_idx in (-3, -2, -1)
+    if layer_idx >= 0:
+        layer_attn = attn_list[token_idx][layer_idx]  # (num_heads, 1, seq)
+        num_heads = layer_attn.shape[0]
+        if head_idx >= num_heads:
+            return None
+        if head_idx >= 0:
+            attn = layer_attn[head_idx, 0, :].astype(np.float32)
+        else:
+            if head_idx == -1:
+                attn = layer_attn[:, 0, :].mean(axis=0).astype(np.float32)
+            elif head_idx == -2:
+                attn = _weighted_mean_axis0(layer_attn[:, 0, :], axis=0)
+            else:  # -3
+                attn = _trimmed_mean_axis0(layer_attn[:, 0, :], trim_frac=0.25, axis=0)
+    else:
+        stacked = np.stack([attn_list[token_idx][l][:, 0, :] for l in range(num_layers)], axis=0)
+        nh = stacked.shape[1]
+        if head_idx >= nh:
+            return None
+        if head_idx >= 0:
+            single_head = stacked[:, head_idx, :]  # (num_layers, seq)
+            if layer_idx == -1:
+                attn = single_head.mean(axis=0).astype(np.float32)
+            elif layer_idx == -2:
+                attn = _weighted_mean_axis0(single_head, axis=0)
+            else:
+                attn = _trimmed_mean_axis0(single_head, trim_frac=0.25, axis=0)
+        else:
+            # average over both layers and heads
+            flat = stacked.reshape(-1, stacked.shape[2])  # (L*H, seq)
+            if layer_idx == -1 and head_idx == -1:
+                attn = flat.mean(axis=0).astype(np.float32)
+            elif layer_idx == -2 or head_idx == -2:
+                attn = _weighted_mean_axis0(flat, axis=0)
+            else:
+                attn = _trimmed_mean_axis0(flat, trim_frac=0.25, axis=0)
+    n = min(image_token_count, attn.shape[0])
+    attn_img = attn[:n].copy()
+    if threshold > 0:
+        attn_img = np.where(attn_img >= threshold, attn_img, 0.0)
+    num_patches = PATCH_ROWS * PATCH_COLS
+    if attn_img.size < num_patches * TOKENS_PER_PATCH:
+        attn_img = np.pad(attn_img, (0, num_patches * TOKENS_PER_PATCH - attn_img.size), constant_values=0.0)
+    attn_img = attn_img[: num_patches * TOKENS_PER_PATCH].reshape(num_patches, TOKENS_PER_PATCH)
+    patch_attn = attn_img.mean(axis=1)
+    grid = patch_attn.reshape(PATCH_ROWS, PATCH_COLS)
+    heatmap = np.repeat(np.repeat(grid, PATCH_PIXELS, axis=0), PATCH_PIXELS, axis=1)
+    return heatmap
+
+
+def attention_raw_vector(attn_list, token_idx, layer_idx, head_idx, image_token_count):
+    """Return the 1D attention vector over image tokens (for distribution stats). Same aggregation as attention_to_heatmap."""
+    if token_idx >= len(attn_list):
+        return None
+    num_layers = len(attn_list[0])
+    if num_layers == 0 or layer_idx >= num_layers:
+        return None
+    if layer_idx >= 0:
+        layer_attn = attn_list[token_idx][layer_idx]
+        num_heads = layer_attn.shape[0]
+        if head_idx >= num_heads:
+            return None
+        if head_idx >= 0:
+            attn = layer_attn[head_idx, 0, :].astype(np.float32)
+        else:
+            if head_idx == -1:
+                attn = layer_attn[:, 0, :].mean(axis=0).astype(np.float32)
+            elif head_idx == -2:
+                attn = _weighted_mean_axis0(layer_attn[:, 0, :], axis=0)
+            else:
+                attn = _trimmed_mean_axis0(layer_attn[:, 0, :], trim_frac=0.25, axis=0)
+    else:
+        stacked = np.stack([attn_list[token_idx][l][:, 0, :] for l in range(num_layers)], axis=0)
+        nh = stacked.shape[1]
+        if head_idx >= nh:
+            return None
+        if head_idx >= 0:
+            single_head = stacked[:, head_idx, :]
+            if layer_idx == -1:
+                attn = single_head.mean(axis=0).astype(np.float32)
+            elif layer_idx == -2:
+                attn = _weighted_mean_axis0(single_head, axis=0)
+            else:
+                attn = _trimmed_mean_axis0(single_head, trim_frac=0.25, axis=0)
+        else:
+            flat = stacked.reshape(-1, stacked.shape[2])
+            if layer_idx == -1 and head_idx == -1:
+                attn = flat.mean(axis=0).astype(np.float32)
+            elif layer_idx == -2 or head_idx == -2:
+                attn = _weighted_mean_axis0(flat, axis=0)
+            else:
+                attn = _trimmed_mean_axis0(flat, trim_frac=0.25, axis=0)
+    n = min(image_token_count, attn.shape[0])
+    return attn[:n].copy()
+
+
+def heatmap_to_bbox(heatmap, percentile=80, margin_frac=0.05):
+    """Get axis-aligned bbox of the hot region (above percentile). Returns (x_min, y_min, x_max, y_max) in pixel coords."""
+    if heatmap.size == 0:
+        return None
+    thresh = np.percentile(heatmap, percentile)
+    above = heatmap >= thresh
+    if not np.any(above):
+        return None
+    rows = np.any(above, axis=1)
+    cols = np.any(above, axis=0)
+    y_min, y_max = np.where(rows)[0][[0, -1]]
+    x_min, x_max = np.where(cols)[0][[0, -1]]
+    h, w = heatmap.shape
+    margin_x = max(1, int((x_max - x_min) * margin_frac))
+    margin_y = max(1, int((y_max - y_min) * margin_frac))
+    x_min = max(0, x_min - margin_x)
+    x_max = min(w, x_max + margin_x)
+    y_min = max(0, y_min - margin_y)
+    y_max = min(h, y_max + margin_y)
+    return (x_min, y_min, x_max, y_max)
+
+
+def heatmap_to_bboxes(heatmap, percentile=80, margin_frac=0.05, max_boxes=5):
+    """Get one or more axis-aligned bboxes for hot regions. Returns list of (x_min, y_min, x_max, y_max)."""
+    main = heatmap_to_bbox(heatmap, percentile=percentile, margin_frac=margin_frac)
+    if main is None:
+        return []
+    return [main]
+
+
+def attention_distribution_stats(raw_attn, num_bins=32):
+    """Return min, max, percentiles, and histogram counts for normalized distribution (sum=1; comparable across layers/heads)."""
+    if raw_attn is None or raw_attn.size == 0:
+        return None
+    arr = np.asarray(raw_attn).ravel().astype(np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None
+    total = float(arr.sum())
+    if total < 1e-12:
+        total = 1.0
+    normalized = arr / total
+    vmin, vmax = float(np.min(normalized)), float(np.max(normalized))
+    rng = (vmin, vmax + 1e-12) if vmax > vmin else (0.0, 1.0)
+    counts, bin_edges = np.histogram(normalized, bins=num_bins, range=rng)
+    return {
+        "min": vmin,
+        "max": vmax,
+        "mean": float(np.mean(normalized)),
+        "p5": float(np.percentile(normalized, 5)),
+        "p25": float(np.percentile(normalized, 25)),
+        "p50": float(np.percentile(normalized, 50)),
+        "p75": float(np.percentile(normalized, 75)),
+        "p95": float(np.percentile(normalized, 95)),
+        "histogram": counts.tolist(),
+        "bin_edges": bin_edges.tolist(),
+    }
+
+
+def attention_histogram_base64(stats, width=280, height=120):
+    """Draw a small histogram from distribution stats; return base64 PNG."""
+    if not stats or "histogram" not in stats:
+        return None
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    counts = stats["histogram"]
+    edges = stats.get("bin_edges", [])
+    if len(edges) != len(counts) + 1:
+        edges = np.linspace(stats["min"], stats["max"], len(counts) + 1).tolist()
+    fig, ax = plt.subplots(figsize=(width / 80, height / 80), dpi=80)
+    ax.bar(range(len(counts)), counts, color="orangered", alpha=0.8, edgecolor="none")
+    ax.set_xlabel("Norm. attention (bin)")
+    ax.set_ylabel("Count")
+    ax.set_title("Distribution (normalized)")
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight", dpi=80)
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def heatmap_to_base64_png(heatmap, threshold=0.0, percentile_normalize=True, p_low=5, p_high=95):
+    """Percentile-normalize by default so contrast is visible when values are similar."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    if threshold > 0:
+        heatmap = np.where(heatmap >= threshold, heatmap, 0.0)
+    vmin, vmax = heatmap.min(), heatmap.max()
+    if percentile_normalize and heatmap.size > 0:
+        vmin = np.percentile(heatmap, p_low)
+        vmax = np.percentile(heatmap, p_high)
+    if vmax - vmin > 1e-6:
+        heatmap = np.clip((heatmap - vmin) / (vmax - vmin), 0.0, 1.0).astype(np.float32)
+    else:
+        heatmap = np.zeros_like(heatmap)
+    fig, ax = plt.subplots(figsize=(heatmap.shape[1] / 100, heatmap.shape[0] / 100), dpi=100)
+    ax.imshow(heatmap, cmap="hot", alpha=0.7, interpolation="bilinear")
+    ax.axis("off")
+    ax.set_position([0, 0, 1, 1])
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight", pad_inches=0, transparent=True, dpi=100)
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 def ask_llava(model, processor, image: Image.Image, question: str, device) -> str:
@@ -318,7 +620,11 @@ HTML_PAGE = """<!DOCTYPE html>
 
       <label for="question">Question</label>
       <textarea id="question" placeholder="e.g. Is the person wearing a hardhat? Answer yes or no."></textarea>
-      <button type="button" id="askBtn" disabled>Ask</button>
+      <div style="display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:8px;">
+        <button type="button" id="askBtn" disabled>Ask</button>
+        <button type="button" id="btnViewAttention" class="secondary" title="Same image + question on port 8088, open attention heatmap">View attention map</button>
+        <span id="attentionStatus" style="color:#888; font-size:0.85rem;"></span>
+      </div>
     </div>
     <div class="card">
       <h2 style="font-size:1.1rem; margin-top:0;">Pipeline</h2>
@@ -1024,6 +1330,52 @@ HTML_PAGE = """<!DOCTYPE html>
           .finally(function() { askBtn.disabled = false; updateAskBtn(); });
       });
 
+      document.getElementById('btnViewAttention').addEventListener('click', function() {
+        var q = question.value.trim();
+        if (!q) {
+          document.getElementById('attentionStatus').textContent = 'Enter a question first.';
+          return;
+        }
+        function doSend(imgB64) {
+          if (!imgB64) {
+            document.getElementById('attentionStatus').textContent = 'Select an image (upload, capture webcam, or Ask on YouTube first).';
+            return;
+          }
+          document.getElementById('attentionStatus').textContent = 'Running with attention…';
+          fetch('/run_attention', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image_base64: imgB64, question: q })
+          })
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+              document.getElementById('attentionStatus').textContent = '';
+              if (d.error) {
+                document.getElementById('attentionStatus').textContent = d.error;
+                return;
+              }
+              window.open('/attention?from_8087=1', '_blank');
+            })
+            .catch(function(e) {
+              document.getElementById('attentionStatus').textContent = 'Error: ' + e.message;
+            });
+        }
+        if (source === 'youtube' && lastYtFrameBase64) {
+          doSend(lastYtFrameBase64);
+        } else if (source === 'webcam' && capturedDataUrl) {
+          doSend(capturedDataUrl.split(',')[1]);
+        } else if (source === 'upload' && file.files && file.files[0]) {
+          var fr = new FileReader();
+          fr.onload = function() {
+            var dataUrl = fr.result;
+            doSend(dataUrl.indexOf(',') >= 0 ? dataUrl.split(',')[1] : dataUrl);
+          };
+          fr.readAsDataURL(file.files[0]);
+        } else {
+          doSend(null);
+        }
+      });
+
       function checkReady() {
         fetch('/health').then(function(r) { return r.json(); }).then(function(d) {
           if (d.model_loaded) {
@@ -1038,6 +1390,139 @@ HTML_PAGE = """<!DOCTYPE html>
       checkReady();
     })();
   </script>
+</body>
+</html>
+"""
+
+ATTENTION_HTML_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>VLM Attention Map</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#1a1a1a;color:#e0e0e0;margin:16px;}
+.panel{background:#2a2a2a;padding:12px;border-radius:8px;margin-bottom:12px;}
+button{padding:8px 14px;background:#0a7;color:#fff;border:none;border-radius:6px;cursor:pointer;}
+button.secondary{background:#555;}
+.tokens span{display:inline;padding:2px 4px;margin:1px;cursor:pointer;border-radius:3px;}
+.tokens span:hover{background:#444}.tokens span.selected{background:#0a7;}
+#imageContainer{position:relative;display:inline-block;}
+#preview{display:block;max-width:100%;height:auto;}
+#heatmapOverlay{position:absolute;left:0;top:0;width:100%;height:100%;object-fit:fill;pointer-events:none;opacity:0.75;}
+</style>
+</head>
+<body>
+<h1>VLM Attention Map</h1>
+<p style="color:#888">Uses the same model as the QA service (no extra load). After running, click a word to see where the model looked.</p>
+  <div class="panel" style="font-size:0.85rem;color:#aaa">
+  <strong>Layer &amp; Head:</strong> <strong>Layer</strong> = depth (early = low-level, later = semantic). <strong>-1</strong> = mean over all layers; <strong>-2</strong> = weighted average (later layers count more); <strong>-3</strong> = trimmed mean (drop top/bottom 25%%). Same for <strong>Head</strong>. <strong>Token</strong> = the word you clicked; the heatmap shows where the model looked.
+</div>
+<div class="panel">
+  <label>Image</label><input type="file" id="file" accept="image/*"><br>
+  <label>Question</label><input type="text" id="question" placeholder="e.g. Where is the white truck?" style="width:320px;margin-top:4px"><br>
+  <button id="runBtn" style="margin-top:8px">Run</button><span id="runStatus" style="margin-left:8px;color:#888"></span>
+</div>
+<div class="panel" id="resultPanel" style="display:none">
+  <strong>Answer:</strong> <span id="answer"></span>
+  <div id="noAttnMsg" style="display:none;color:#888">Attention not available (SmolVLM2 only).</div>
+  <div class="tokens" id="tokens"></div>
+  <div id="mapControls" style="margin-top:12px">
+    Token index <input type="number" id="tokenIdx" min="0" value="0" style="width:50px" title="Which word (0=first)">
+    Layer <input type="number" id="layer" min="-3" value="-1" style="width:50px" title="-3 trimmed, -2 weighted, -1 mean, 0..N single layer">
+    Head <input type="number" id="head" min="-3" value="-1" style="width:50px" title="-3 trimmed, -2 weighted, -1 mean, 0..N single head">
+    Threshold <input type="number" id="threshold" min="0" max="1" step="0.05" value="0" style="width:50px">
+    Percentile <input type="number" id="percentile" min="50" max="99" value="80" style="width:50px" title="For bboxes: keep pixels above this percentile">
+    <button id="mapBtn" class="secondary">Show attention map</button>
+    <button id="extractBtn" class="secondary" style="margin-left:8px">Extract &amp; plot only this region</button>
+    <button id="bboxBtn" class="secondary" style="margin-left:8px">Tag subject &amp; bboxes</button>
+    <span id="mapExtractStatus" style="color:#c66;margin-left:8px;font-size:0.9rem;"></span>
+  </div>
+</div>
+<div class="panel" id="imagePanel" style="display:none">
+  <div id="imageContainer"><img id="preview" alt="preview"><img id="heatmapOverlay" alt="heatmap" style="display:none"></div>
+  <div id="distributionPanel" style="margin-top:12px;display:none">
+    <strong>Normalized attention distribution</strong> (as you flip layers/heads):<br>
+    <img id="distributionHistogram" alt="distribution" style="max-width:100%;margin-top:4px;">
+    <div id="distributionStats" style="font-size:0.8rem;color:#aaa;margin-top:4px;"></div>
+  </div>
+</div>
+<div class="panel" id="extractPanel" style="display:none">
+  <strong>Extracted region</strong> (attended area for the selected token, e.g. the white truck):<br>
+  <img id="extractedImg" alt="extracted" style="max-width:100%;margin-top:8px;border:2px solid #0a7;">
+</div>
+<div class="panel" id="bboxPanel" style="display:none">
+  <strong>Tagged subject &amp; bounding boxes</strong> (from attention heatmap):<br>
+  <img id="bboxImg" alt="image with bboxes" style="max-width:100%;margin-top:8px;border:2px solid #0a7;">
+</div>
+<script>
+var lastTokens=[],lastNumLayers=0,lastNumHeads=0;
+function applyLastResult(d){
+  if(!d||d.error)return;
+  lastTokens=d.tokens||[];lastNumLayers=d.num_layers||0;lastNumHeads=d.num_heads||0;
+  document.getElementById('answer').textContent=d.answer||'';
+  var attnOk=d.attention_available&&lastNumLayers>0&&lastNumHeads>0;
+  document.getElementById('mapControls').style.display='block';
+  document.getElementById('noAttnMsg').style.display=attnOk?'none':'block';
+  document.getElementById('mapExtractStatus').textContent='';
+  var tokensEl=document.getElementById('tokens');tokensEl.innerHTML='';
+  lastTokens.forEach(function(t,i){
+    var s=document.createElement('span');s.textContent=t;s.dataset.index=i;
+    s.onclick=function(){document.getElementById('tokenIdx').value=this.dataset.index;document.querySelectorAll('.tokens span.selected').forEach(function(x){x.classList.remove('selected');});this.classList.add('selected');};
+    tokensEl.appendChild(s);
+  });
+  document.getElementById('tokenIdx').max=Math.max(0,lastTokens.length-1);
+  document.getElementById('layer').max=Math.max(0,lastNumLayers-1);
+  document.getElementById('head').max=Math.max(0,lastNumHeads-1);
+  document.getElementById('resultPanel').style.display='block';
+  if(d.image_base64){document.getElementById('preview').src='data:image/png;base64,'+d.image_base64;document.getElementById('imagePanel').style.display='block';}
+}
+function parseLayerHead(elId, defaultVal){var v=document.getElementById(elId).value;var n=parseInt(v,10);return (v===''||isNaN(n))?defaultVal:n;}
+document.getElementById('runBtn').onclick=function(){
+  if(!document.getElementById('file').files.length){document.getElementById('runStatus').textContent='Select an image.';return;}
+  var q=document.getElementById('question').value.trim();if(!q){document.getElementById('runStatus').textContent='Enter a question.';return;}
+  document.getElementById('runStatus').textContent='Running…';this.disabled=true;
+  var fd=new FormData();fd.append('image',document.getElementById('file').files[0]);fd.append('question',q);
+  fetch('/run_attention',{method:'POST',body:fd}).then(function(r){return r.json();}).then(function(d){
+    document.getElementById('runBtn').disabled=false;
+    if(d.error){document.getElementById('runStatus').textContent=d.error;return;}
+    document.getElementById('runStatus').textContent='Done.';applyLastResult(d);
+  }).catch(function(e){document.getElementById('runBtn').disabled=false;document.getElementById('runStatus').textContent='Error: '+e.message;});
+};
+document.getElementById('mapBtn').onclick=function(){
+  var statusEl=document.getElementById('mapExtractStatus');
+  statusEl.textContent='';
+  var tokenIdx=parseInt(document.getElementById('tokenIdx').value,10)||0,layer=parseLayerHead('layer',-1),head=parseLayerHead('head',-1),threshold=parseFloat(document.getElementById('threshold').value)||0;
+  fetch('/attention_map?token_idx='+tokenIdx+'&layer='+layer+'&head='+head+'&threshold='+threshold).then(function(r){if(!r.ok)return r.text().then(function(t){throw new Error(t||r.status);});return r.json();}).then(function(d){
+    if(d.error){document.getElementById('heatmapOverlay').style.display='none';document.getElementById('distributionPanel').style.display='none';statusEl.textContent=d.error;return;}
+    var ov=document.getElementById('heatmapOverlay');
+    ov.src='data:image/png;base64,'+d.heatmap;
+    ov.style.display='block';
+    var pr=document.getElementById('preview');
+    ov.style.width=pr.offsetWidth+'px';ov.style.height=pr.offsetHeight+'px';
+    var distPanel=document.getElementById('distributionPanel');
+    if(d.distribution_histogram){document.getElementById('distributionHistogram').src='data:image/png;base64,'+d.distribution_histogram;distPanel.style.display='block';}else{distPanel.style.display='none';}
+    var statsEl=document.getElementById('distributionStats');
+    if(d.distribution){var s=d.distribution;statsEl.textContent='min='+(s.min!=null?s.min.toExponential(2):'')+' max='+(s.max!=null?s.max.toExponential(2):'')+' p50='+(s.p50!=null?s.p50.toExponential(2):'')+' p95='+(s.p95!=null?s.p95.toExponential(2):'');statsEl.style.display='block';}else{statsEl.style.display='none';}
+  }).catch(function(e){document.getElementById('heatmapOverlay').style.display='none';statusEl.textContent='Network error: '+e.message;});
+};
+document.getElementById('extractBtn').onclick=function(){
+  var statusEl=document.getElementById('mapExtractStatus');
+  statusEl.textContent='';
+  var tokenIdx=parseInt(document.getElementById('tokenIdx').value,10)||0,layer=parseLayerHead('layer',-1),head=parseLayerHead('head',-1),threshold=parseFloat(document.getElementById('threshold').value)||0;
+  fetch('/extract_attended_region?token_idx='+tokenIdx+'&layer='+layer+'&head='+head+'&threshold='+threshold).then(function(r){if(!r.ok)return r.text().then(function(t){throw new Error(t||r.status);});return r.json();}).then(function(d){
+    if(d.error){document.getElementById('extractPanel').style.display='none';statusEl.textContent=d.error;return;}
+    document.getElementById('extractedImg').src='data:image/png;base64,'+d.image_base64;
+    document.getElementById('extractPanel').style.display='block';
+  }).catch(function(e){document.getElementById('extractPanel').style.display='none';statusEl.textContent='Network error: '+e.message;});
+};
+document.getElementById('bboxBtn').onclick=function(){
+  var tokenIdx=parseInt(document.getElementById('tokenIdx').value,10)||0,layer=parseLayerHead('layer',-1),head=parseLayerHead('head',-1),threshold=parseFloat(document.getElementById('threshold').value)||0,percentile=parseFloat(document.getElementById('percentile').value)||80;
+  fetch('/attention_bboxes?token_idx='+tokenIdx+'&layer='+layer+'&head='+head+'&threshold='+threshold+'&percentile='+percentile).then(function(r){return r.json();}).then(function(d){
+    if(d.error){document.getElementById('bboxPanel').style.display='none';return;}
+    document.getElementById('bboxImg').src='data:image/png;base64,'+d.image_with_boxes_base64;
+    document.getElementById('bboxPanel').style.display='block';
+  }).catch(function(){document.getElementById('bboxPanel').style.display='none';});
+};
+if(window.location.search.indexOf('from_8087=1')>=0){fetch('/last_attention_result').then(function(r){return r.json();}).then(applyLastResult).catch(function(){});}
+</script>
 </body>
 </html>
 """
@@ -1060,6 +1545,72 @@ class VLMQAHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.end_headers()
         self.wfile.write(html.encode("utf-8"))
+
+    def _handle_run_attention(self):
+        """POST /run_attention: image + question, run with output_attentions (SmolVLM only), store and return."""
+        global _last_attention_run
+        if self.server.model is None:
+            self.send_json({"error": "Model not loaded yet"}, 503)
+            return
+        model_name = getattr(self.server, "model_name", "")
+        if model_name not in ("smolvlm2-2.2b", "smolvlm2-500m"):
+            self.send_json({"error": "Attention map only supported for SmolVLM2. Current model: %s" % model_name}, 400)
+            return
+        content_type = self.headers.get("Content-Type", "")
+        image = None
+        question = ""
+        try:
+            if "application/json" in content_type:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8") if length else "{}"
+                data = json.loads(body)
+                question = (data.get("question") or "").strip()
+                b64 = data.get("image_base64") or data.get("image") or ""
+                if not question or not b64:
+                    self.send_json({"error": "Missing question or image_base64"}, 400)
+                    return
+                if "," in str(b64):
+                    b64 = str(b64).split(",", 1)[1]
+                raw = base64.b64decode(b64)
+                image = Image.open(io.BytesIO(raw)).convert("RGB")
+            else:
+                form = cgi.FieldStorage(fp=self.rfile, environ={
+                    "REQUEST_METHOD": "POST",
+                    "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+                    "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
+                })
+                if "question" in form:
+                    question = (form["question"].value or "").strip()
+                if "image" in form:
+                    fp = form["image"].file
+                    image = Image.open(fp).convert("RGB")
+                if not question or image is None:
+                    self.send_json({"error": "Missing question or image file"}, 400)
+                    return
+            answer, tokens, attn_list, num_layers, num_heads = run_with_attentions_smolvlm(
+                self.server.model, self.server.processor, image, question, self.server.device
+            )
+            buf = io.BytesIO()
+            image.save(buf, format="PNG")
+            img_b64 = base64.b64encode(buf.getvalue()).decode()
+            _last_attention_run = {
+                "attn": attn_list,
+                "tokens": tokens,
+                "num_layers": num_layers,
+                "num_heads": num_heads,
+                "answer": answer,
+                "image_base64": img_b64,
+            }
+            self.send_json({
+                "answer": answer,
+                "tokens": tokens,
+                "num_layers": num_layers,
+                "num_heads": num_heads,
+                "image_base64": img_b64,
+                "attention_available": attn_list is not None,
+            })
+        except Exception as e:
+            self.send_json({"error": str(e)}, 500)
 
     def _handle_detect(self):
         """POST /detect: image (multipart or JSON image_base64) -> { frame_base64, detections }."""
@@ -1176,9 +1727,11 @@ class VLMQAHandler(BaseHTTPRequestHandler):
                 "model": getattr(self.server, "model_name", "?"),
                 "endpoints": {
                     "GET /": "Web UI: upload, webcam, or YouTube — ask a question",
+                    "GET /attention": "Attention map UI (same model, no extra load)",
                     "GET /health": "Health / loading progress",
                     "POST /ask": "Body: multipart (image file + question) or JSON { \"image_base64\": \"...\", \"question\": \"...\" }. Returns { \"answer\": \"...\" }.",
                     "POST /ask_youtube": "Body: JSON { \"url\": \"YouTube URL\", \"time_sec\": 0, \"question\": \"...\" }. Returns { \"answer\": \"...\" }.",
+                    "POST /run_attention": "Same as /ask but with output_attentions (SmolVLM2 only). Returns answer, tokens, attention data.",
                     "POST /detect": "Body: multipart (image file) or JSON { \"image_base64\": \"...\" }. Returns { \"frame_base64\": \"...\", \"detections\": [...] }.",
                     "POST /detect_youtube": "Body: JSON { \"url\": \"YouTube URL\", \"time_sec\": 0 }. Returns { \"frame_base64\": \"...\", \"detections\": [...] } (no VLM).",
                 },
@@ -1188,11 +1741,158 @@ class VLMQAHandler(BaseHTTPRequestHandler):
         if path == "/":
             self.send_html(HTML_PAGE)
             return
+        if path == "/attention":
+            self.send_html(ATTENTION_HTML_PAGE)
+            return
+        if path == "/last_attention_result":
+            run = _last_attention_run
+            if run["attn"] is None and not run.get("tokens"):
+                self.send_json({"error": "No run yet"}, 404)
+                return
+            self.send_json({
+                "answer": run.get("answer", ""),
+                "tokens": run.get("tokens", []),
+                "num_layers": run.get("num_layers", 0),
+                "num_heads": run.get("num_heads", 0),
+                "image_base64": run.get("image_base64"),
+                "attention_available": run.get("attn") is not None,
+            })
+            return
+        if path.startswith("/attention_map"):
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(self.path).query)
+            token_idx = int(qs.get("token_idx", [0])[0])
+            layer = int(qs.get("layer", [-1])[0])
+            head = int(qs.get("head", [-1])[0])
+            threshold = float(qs.get("threshold", [0])[0])
+            run = _last_attention_run
+            if run["attn"] is None:
+                self.send_json({"error": "No attention data. Run image + question first."}, 400)
+                return
+            attn_list, num_layers, num_heads = run["attn"], run["num_layers"], run["num_heads"]
+            if token_idx < 0 or token_idx >= len(attn_list) or layer < -3 or layer >= num_layers or head < -3 or head >= num_heads:
+                self.send_json({"error": "Invalid token/layer/head (layer/head: -3 trimmed, -2 weighted, -1 mean, >=0 single)"}, 400)
+                return
+            try:
+                heatmap = attention_to_heatmap(attn_list, token_idx, layer, head, IMAGE_TOKEN_COUNT, threshold=threshold)
+                if heatmap is None:
+                    self.send_json({"error": "Could not build heatmap"}, 400)
+                    return
+                raw = attention_raw_vector(attn_list, token_idx, layer, head, IMAGE_TOKEN_COUNT)
+                stats = attention_distribution_stats(raw) if raw is not None else None
+                hist_b64 = attention_histogram_base64(stats) if stats else None
+                b64 = heatmap_to_base64_png(heatmap, threshold=threshold, percentile_normalize=True)
+                out = {"heatmap": b64}
+                if stats is not None:
+                    out["distribution"] = {k: v for k, v in stats.items() if k != "bin_edges"}
+                if hist_b64:
+                    out["distribution_histogram"] = hist_b64
+                self.send_json(out)
+            except Exception as e:
+                self.send_json({"error": str(e)}, 500)
+            return
+        if path.startswith("/extract_attended_region"):
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(self.path).query)
+            token_idx = int(qs.get("token_idx", [0])[0])
+            layer = int(qs.get("layer", [-1])[0])
+            head = int(qs.get("head", [-1])[0])
+            threshold = float(qs.get("threshold", [0])[0])
+            percentile = float(qs.get("percentile", [80])[0])
+            run = _last_attention_run
+            if run["attn"] is None or not run.get("image_base64"):
+                self.send_json({"error": "No run or image. Run image + question first."}, 400)
+                return
+            attn_list = run["attn"]
+            num_layers, num_heads = run["num_layers"], run["num_heads"]
+            if token_idx < 0 or token_idx >= len(attn_list) or layer < -3 or layer >= num_layers or head < -3 or head >= num_heads:
+                self.send_json({"error": "Invalid token/layer/head (layer/head: -3 trimmed, -2 weighted, -1 mean)"}, 400)
+                return
+            try:
+                heatmap = attention_to_heatmap(attn_list, token_idx, layer, head, IMAGE_TOKEN_COUNT, threshold=threshold)
+                if heatmap is None:
+                    self.send_json({"error": "Could not build heatmap"}, 400)
+                    return
+                bbox = heatmap_to_bbox(heatmap, percentile=percentile)
+                if bbox is None:
+                    self.send_json({"error": "No hot region found"}, 400)
+                    return
+                x_hm_min, y_hm_min, x_hm_max, y_hm_max = bbox
+                H_hm, W_hm = heatmap.shape[0], heatmap.shape[1]
+                img_raw = base64.b64decode(run["image_base64"])
+                img = Image.open(io.BytesIO(img_raw)).convert("RGB")
+                W_img, H_img = img.size[0], img.size[1]
+                x_min = int(x_hm_min * W_img / W_hm)
+                x_max = int(x_hm_max * W_img / W_hm)
+                y_min = int(y_hm_min * H_img / H_hm)
+                y_max = int(y_hm_max * H_img / H_hm)
+                x_min, x_max = max(0, x_min), min(W_img, x_max)
+                y_min, y_max = max(0, y_min), min(H_img, y_max)
+                if x_max <= x_min or y_max <= y_min:
+                    self.send_json({"error": "Empty crop"}, 400)
+                    return
+                cropped = img.crop((x_min, y_min, x_max, y_max))
+                buf = io.BytesIO()
+                cropped.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode()
+                self.send_json({"image_base64": b64, "bbox": [x_min, y_min, x_max, y_max]})
+            except Exception as e:
+                self.send_json({"error": str(e)}, 500)
+            return
+        if path.startswith("/attention_bboxes"):
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(self.path).query)
+            token_idx = int(qs.get("token_idx", [0])[0])
+            layer = int(qs.get("layer", [-1])[0])
+            head = int(qs.get("head", [-1])[0])
+            threshold = float(qs.get("threshold", [0])[0])
+            percentile = float(qs.get("percentile", [80])[0])
+            run = _last_attention_run
+            if run["attn"] is None or not run.get("image_base64"):
+                self.send_json({"error": "No run or image. Run image + question first."}, 400)
+                return
+            attn_list = run["attn"]
+            num_layers, num_heads = run["num_layers"], run["num_heads"]
+            if token_idx < 0 or token_idx >= len(attn_list) or layer < -3 or layer >= num_layers or head < -3 or head >= num_heads:
+                self.send_json({"error": "Invalid token/layer/head (layer/head: -3 trimmed, -2 weighted, -1 mean)"}, 400)
+                return
+            try:
+                heatmap = attention_to_heatmap(attn_list, token_idx, layer, head, IMAGE_TOKEN_COUNT, threshold=threshold)
+                if heatmap is None:
+                    self.send_json({"error": "Could not build heatmap"}, 400)
+                    return
+                bboxes_hm = heatmap_to_bboxes(heatmap, percentile=percentile)
+                H_hm, W_hm = heatmap.shape[0], heatmap.shape[1]
+                img_raw = base64.b64decode(run["image_base64"])
+                img = Image.open(io.BytesIO(img_raw)).convert("RGB")
+                W_img, H_img = img.size[0], img.size[1]
+                bboxes_img = []
+                for (x_hm_min, y_hm_min, x_hm_max, y_hm_max) in bboxes_hm:
+                    x_min = max(0, int(x_hm_min * W_img / W_hm))
+                    x_max = min(W_img, int(x_hm_max * W_img / W_hm))
+                    y_min = max(0, int(y_hm_min * H_img / H_hm))
+                    y_max = min(H_img, int(y_hm_max * H_img / H_hm))
+                    if x_max > x_min and y_max > y_min:
+                        bboxes_img.append([x_min, y_min, x_max, y_max])
+                from PIL import ImageDraw
+                draw = ImageDraw.Draw(img)
+                for (x_min, y_min, x_max, y_max) in bboxes_img:
+                    draw.rectangle([x_min, y_min, x_max, y_max], outline=(0, 255, 0), width=max(2, min(W_img, H_img) // 200))
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode()
+                self.send_json({"bboxes": bboxes_img, "image_with_boxes_base64": b64})
+            except Exception as e:
+                self.send_json({"error": str(e)}, 500)
+            return
         self.send_response(404)
         self.end_headers()
 
     def do_POST(self):
         path = self.path.rstrip("/")
+        if path == "/run_attention":
+            self._handle_run_attention()
+            return
         if path == "/ask_youtube":
             self._handle_ask_youtube()
             return
