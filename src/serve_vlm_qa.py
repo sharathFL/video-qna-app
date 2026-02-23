@@ -126,6 +126,8 @@ def extract_one_frame_youtube(url: str, time_sec: float):
 SMOLVLM2_2B = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
 SMOLVLM2_500M = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
 LLAVA_7B = "llava-hf/llava-1.5-7b-hf"
+# DINOv3: self-supervised vision backbone (no language model). https://ai.meta.com/blog/dinov3-self-supervised-vision-model/
+DINOV3_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m"
 
 DEFAULT_PORT = 8087
 MAX_NEW_TOKENS = 80
@@ -181,6 +183,45 @@ def load_llava(device, progress_callback=None):
     return model, processor
 
 
+def load_dinov3(device, progress_callback=None):
+    """Load DINOv3 vision backbone (no language model). Produces dense features for downstream tasks."""
+    from transformers import AutoImageProcessor, AutoModel
+    if progress_callback:
+        progress_callback(10, "Loading DINOv3 processor…")
+    processor = AutoImageProcessor.from_pretrained(DINOV3_MODEL)
+    if progress_callback:
+        progress_callback(30, "Loading DINOv3 backbone…")
+    model = AutoModel.from_pretrained(DINOV3_MODEL)
+    if device.type == "cuda":
+        model = model.to(device)
+    model.eval()
+    if progress_callback:
+        progress_callback(100, "Ready")
+    return model, processor
+
+
+def ask_dinov3(model, processor, image: Image.Image, question: str, device) -> str:
+    """DINOv3 is vision-only: run image through backbone and return feature summary (no QA)."""
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    inp = processor(images=image, return_tensors="pt")
+    inp = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in inp.items()}
+    with torch.no_grad():
+        out = model(**inp)
+    pooled = getattr(out, "pooler_output", None) or (out.last_hidden_state[:, 0] if hasattr(out, "last_hidden_state") else None)
+    patch_feats = getattr(out, "last_hidden_state", None)
+    if pooled is not None:
+        pooled = pooled.cpu().numpy()
+    if patch_feats is not None:
+        patch_feats = patch_feats.cpu().numpy()
+    parts = ["DINOv3 (vision backbone): no language model. Image features extracted."]
+    if pooled is not None:
+        parts.append(" Pooled (CLS) shape: %s." % (list(pooled.shape),))
+    if patch_feats is not None:
+        parts.append(" Patch tokens shape: %s. Use /dinov3_features for raw features." % (list(patch_feats.shape),))
+    return "".join(parts)
+
+
 def ask_smolvlm(model, processor, image: Image.Image, question: str, device) -> str:
     if image.mode != "RGB":
         image = image.convert("RGB")
@@ -217,7 +258,72 @@ PATCH_ROWS, PATCH_COLS = 3, 4
 TOKENS_PER_PATCH = 64
 PATCH_PIXELS = 512
 IMAGE_TOKEN_COUNT = PATCH_ROWS * PATCH_COLS * TOKENS_PER_PATCH
-_last_attention_run = {"attn": None, "tokens": [], "num_layers": 0, "num_heads": 0, "answer": "", "image_base64": None}
+_last_attention_run = {"attn": None, "tokens": [], "num_layers": 0, "num_heads": 0, "answer": "", "image_base64": None, "dinov3": False, "num_register_tokens": 0}
+
+
+def run_dinov3_with_attentions(model, processor, image: Image.Image, device):
+    """Run DINOv3 with output_attentions. Returns attn_list (one item per layer, each (num_heads, seq, seq)), num_layers, num_heads, num_register_tokens.
+    Based on https://github.com/mselmangokmen/Dinov3-attention-map-extraction (CLS → patch attention)."""
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    inp = processor(images=image, return_tensors="pt")
+    inp = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in inp.items()}
+    num_register_tokens = getattr(getattr(model, "config", None), "num_register_tokens", 4)
+    try:
+        with torch.no_grad():
+            out = model(**inp, output_attentions=True)
+    except TypeError:
+        with torch.no_grad():
+            out = model(**inp)
+    if not getattr(out, "attentions", None) or not out.attentions:
+        return None, 0, 0, num_register_tokens
+    # attentions: tuple of (batch, num_heads, seq, seq) per layer
+    attn_list = []
+    for layer_attn in out.attentions:
+        a = layer_attn[0].float().cpu().numpy()  # (num_heads, seq, seq)
+        attn_list.append(a)
+    num_layers = len(attn_list)
+    num_heads = attn_list[0].shape[0] if num_layers else 0
+    return attn_list, num_layers, num_heads, num_register_tokens
+
+
+def dinov3_attention_to_heatmap(attn_list, layer_idx, head_idx, num_register_tokens, out_h, out_w, threshold=0.0):
+    """Build heatmap from DINOv3 CLS→patch attention (https://github.com/mselmangokmen/Dinov3-attention-map-extraction).
+    attn_list: list of (num_heads, seq, seq). CLS=0, then num_register_tokens, then patch tokens. We use attention from CLS to patches."""
+    if not attn_list:
+        return None
+    # layer_idx -1 = last layer (as in reference notebook "layer 11/12")
+    if layer_idx < 0:
+        layer_idx = len(attn_list) + layer_idx
+    if layer_idx < 0 or layer_idx >= len(attn_list):
+        return None
+    attn = attn_list[layer_idx]  # (num_heads, seq, seq)
+    num_heads, seq, _ = attn.shape
+    patch_start = 1 + num_register_tokens
+    n_patches = seq - patch_start
+    if n_patches <= 0:
+        return None
+    if head_idx >= 0 and head_idx < num_heads:
+        cls_to_patch = attn[head_idx, 0, patch_start:].astype(np.float32)
+    else:
+        cls_to_patch = attn[:, 0, patch_start:].mean(axis=0).astype(np.float32)
+    side = int(round(np.sqrt(n_patches)))
+    if side * side != n_patches:
+        side = int(np.ceil(np.sqrt(n_patches)))
+        cls_to_patch = np.pad(cls_to_patch, (0, side * side - n_patches), constant_values=0.0)[: side * side]
+    grid = cls_to_patch.reshape(side, side)
+    if threshold > 0:
+        grid = np.where(grid >= threshold, grid, 0.0)
+    if grid.shape[0] > 0 and grid.shape[1] > 0 and (out_h != side or out_w != side):
+        # Upsample to (out_h, out_w) via repeat and crop
+        ry = max(1, out_h // grid.shape[0])
+        rx = max(1, out_w // grid.shape[1])
+        grid = np.repeat(np.repeat(grid, ry, axis=0), rx, axis=1)[:out_h, :out_w]
+        if grid.shape[0] < out_h or grid.shape[1] < out_w:
+            padded = np.zeros((out_h, out_w), dtype=np.float32)
+            padded[: grid.shape[0], : grid.shape[1]] = grid
+            grid = padded
+    return grid.astype(np.float32)
 
 
 def run_with_attentions_smolvlm(model, processor, image: Image.Image, question: str, device):
@@ -291,23 +397,31 @@ def attention_to_heatmap(attn_list, token_idx, layer_idx, head_idx, image_token_
     num_layers = len(attn_list[0])
     if num_layers == 0 or layer_idx >= num_layers:
         return None
+    # For decoder: use last query position when q_len>1 (attention from the newly generated token)
+    def _q_slice(layer_attn):
+        q_len = layer_attn.shape[1]
+        q_idx = -1 if q_len > 1 else 0
+        return layer_attn[:, q_idx, :]
     layer_agg = layer_idx in (-3, -2, -1)
     if layer_idx >= 0:
-        layer_attn = attn_list[token_idx][layer_idx]  # (num_heads, 1, seq)
+        layer_attn = attn_list[token_idx][layer_idx]  # (num_heads, q_len, seq)
         num_heads = layer_attn.shape[0]
         if head_idx >= num_heads:
             return None
+        q_len = layer_attn.shape[1]
+        q_idx = -1 if q_len > 1 else 0
         if head_idx >= 0:
-            attn = layer_attn[head_idx, 0, :].astype(np.float32)
+            attn = layer_attn[head_idx, q_idx, :].astype(np.float32)
         else:
+            sl = _q_slice(layer_attn)
             if head_idx == -1:
-                attn = layer_attn[:, 0, :].mean(axis=0).astype(np.float32)
+                attn = sl.mean(axis=0).astype(np.float32)
             elif head_idx == -2:
-                attn = _weighted_mean_axis0(layer_attn[:, 0, :], axis=0)
+                attn = _weighted_mean_axis0(sl, axis=0)
             else:  # -3
-                attn = _trimmed_mean_axis0(layer_attn[:, 0, :], trim_frac=0.25, axis=0)
+                attn = _trimmed_mean_axis0(sl, trim_frac=0.25, axis=0)
     else:
-        stacked = np.stack([attn_list[token_idx][l][:, 0, :] for l in range(num_layers)], axis=0)
+        stacked = np.stack([_q_slice(attn_list[token_idx][l]) for l in range(num_layers)], axis=0)
         nh = stacked.shape[1]
         if head_idx >= nh:
             return None
@@ -349,22 +463,29 @@ def attention_raw_vector(attn_list, token_idx, layer_idx, head_idx, image_token_
     num_layers = len(attn_list[0])
     if num_layers == 0 or layer_idx >= num_layers:
         return None
+    def _q_slice(layer_attn):
+        q_len = layer_attn.shape[1]
+        q_idx = -1 if q_len > 1 else 0
+        return layer_attn[:, q_idx, :]
     if layer_idx >= 0:
         layer_attn = attn_list[token_idx][layer_idx]
         num_heads = layer_attn.shape[0]
         if head_idx >= num_heads:
             return None
+        q_len = layer_attn.shape[1]
+        q_idx = -1 if q_len > 1 else 0
         if head_idx >= 0:
-            attn = layer_attn[head_idx, 0, :].astype(np.float32)
+            attn = layer_attn[head_idx, q_idx, :].astype(np.float32)
         else:
+            sl = _q_slice(layer_attn)
             if head_idx == -1:
-                attn = layer_attn[:, 0, :].mean(axis=0).astype(np.float32)
+                attn = sl.mean(axis=0).astype(np.float32)
             elif head_idx == -2:
-                attn = _weighted_mean_axis0(layer_attn[:, 0, :], axis=0)
+                attn = _weighted_mean_axis0(sl, axis=0)
             else:
-                attn = _trimmed_mean_axis0(layer_attn[:, 0, :], trim_frac=0.25, axis=0)
+                attn = _trimmed_mean_axis0(sl, trim_frac=0.25, axis=0)
     else:
-        stacked = np.stack([attn_list[token_idx][l][:, 0, :] for l in range(num_layers)], axis=0)
+        stacked = np.stack([_q_slice(attn_list[token_idx][l]) for l in range(num_layers)], axis=0)
         nh = stacked.shape[1]
         if head_idx >= nh:
             return None
@@ -1411,7 +1532,7 @@ button.secondary{background:#555;}
 </head>
 <body>
 <h1>VLM Attention Map</h1>
-<p style="color:#888">Uses the same model as the QA service (no extra load). After running, click a word to see where the model looked.</p>
+<p style="color:#888">Uses the same model as the QA service (no extra load). <strong id="currentModelLabel">Current model:</strong> <span id="currentModelName" style="color:#8ac">—</span>. After running, click a word (SmolVLM2) or use CLS (DINOv3) to see where the model looked.</p>
   <div class="panel" style="font-size:0.85rem;color:#aaa">
   <strong>Layer &amp; Head:</strong> <strong>Layer</strong> = depth (early = low-level, later = semantic). <strong>-1</strong> = mean over all layers; <strong>-2</strong> = weighted average (later layers count more); <strong>-3</strong> = trimmed mean (drop top/bottom 25%%). Same for <strong>Head</strong>. <strong>Token</strong> = the word you clicked; the heatmap shows where the model looked.
 </div>
@@ -1422,7 +1543,8 @@ button.secondary{background:#555;}
 </div>
 <div class="panel" id="resultPanel" style="display:none">
   <strong>Answer:</strong> <span id="answer"></span>
-  <div id="noAttnMsg" style="display:none;color:#888">Attention not available (SmolVLM2 only).</div>
+  <div id="noAttnMsg" style="display:none;color:#888">Run with an image to get attention map (DINOv3: image only; SmolVLM2: image + question).</div>
+  <div id="dinov3Hint" style="display:none;color:#8ac;font-size:0.85rem;margin-top:4px">DINOv3: CLS→patch attention (see <a href="https://github.com/mselmangokmen/Dinov3-attention-map-extraction" target="_blank">reference</a>). Layer = -1 (last) or 0..N-1, Head = -1 (mean) or 0..N-1.</div>
   <div class="tokens" id="tokens"></div>
   <div id="mapControls" style="margin-top:12px">
     Token index <input type="number" id="tokenIdx" min="0" value="0" style="width:50px" title="Which word (0=first)">
@@ -1461,6 +1583,7 @@ function applyLastResult(d){
   var attnOk=d.attention_available&&lastNumLayers>0&&lastNumHeads>0;
   document.getElementById('mapControls').style.display='block';
   document.getElementById('noAttnMsg').style.display=attnOk?'none':'block';
+  document.getElementById('dinov3Hint').style.display=(d.dinov3&&attnOk)?'block':'none';
   document.getElementById('mapExtractStatus').textContent='';
   var tokensEl=document.getElementById('tokens');tokensEl.innerHTML='';
   lastTokens.forEach(function(t,i){
@@ -1471,6 +1594,7 @@ function applyLastResult(d){
   document.getElementById('tokenIdx').max=Math.max(0,lastTokens.length-1);
   document.getElementById('layer').max=Math.max(0,lastNumLayers-1);
   document.getElementById('head').max=Math.max(0,lastNumHeads-1);
+  if(d.dinov3){document.getElementById('layer').min=-1; document.getElementById('layer').value=-1; document.getElementById('layer').title='DINOv3: -1 = last layer (recommended), 0..N-1';} else {document.getElementById('layer').min=-3;}
   document.getElementById('resultPanel').style.display='block';
   if(d.image_base64){document.getElementById('preview').src='data:image/png;base64,'+d.image_base64;document.getElementById('imagePanel').style.display='block';}
 }
@@ -1521,7 +1645,9 @@ document.getElementById('bboxBtn').onclick=function(){
     document.getElementById('bboxPanel').style.display='block';
   }).catch(function(){document.getElementById('bboxPanel').style.display='none';});
 };
-if(window.location.search.indexOf('from_8087=1')>=0){fetch('/last_attention_result').then(function(r){return r.json();}).then(applyLastResult).catch(function(){});}
+function setCurrentModel(name){var el=document.getElementById('currentModelName');if(el)el.textContent=name||'—';}
+if(window.location.search.indexOf('from_8087=1')>=0){fetch('/last_attention_result').then(function(r){return r.json();}).then(function(d){setCurrentModel(d.model_name);applyLastResult(d);}).catch(function(){});}
+fetch('/info').then(function(r){return r.json();}).then(function(d){setCurrentModel(d.model);}).catch(function(){});
 </script>
 </body>
 </html>
@@ -1547,15 +1673,12 @@ class VLMQAHandler(BaseHTTPRequestHandler):
         self.wfile.write(html.encode("utf-8"))
 
     def _handle_run_attention(self):
-        """POST /run_attention: image + question, run with output_attentions (SmolVLM only), store and return."""
+        """POST /run_attention: image (+ question for SmolVLM), run with output_attentions; store and return. Supports SmolVLM2 and DINOv3."""
         global _last_attention_run
         if self.server.model is None:
             self.send_json({"error": "Model not loaded yet"}, 503)
             return
         model_name = getattr(self.server, "model_name", "")
-        if model_name not in ("smolvlm2-2.2b", "smolvlm2-500m"):
-            self.send_json({"error": "Attention map only supported for SmolVLM2. Current model: %s" % model_name}, 400)
-            return
         content_type = self.headers.get("Content-Type", "")
         image = None
         question = ""
@@ -1566,8 +1689,8 @@ class VLMQAHandler(BaseHTTPRequestHandler):
                 data = json.loads(body)
                 question = (data.get("question") or "").strip()
                 b64 = data.get("image_base64") or data.get("image") or ""
-                if not question or not b64:
-                    self.send_json({"error": "Missing question or image_base64"}, 400)
+                if not b64:
+                    self.send_json({"error": "Missing image_base64"}, 400)
                     return
                 if "," in str(b64):
                     b64 = str(b64).split(",", 1)[1]
@@ -1584,9 +1707,43 @@ class VLMQAHandler(BaseHTTPRequestHandler):
                 if "image" in form:
                     fp = form["image"].file
                     image = Image.open(fp).convert("RGB")
-                if not question or image is None:
-                    self.send_json({"error": "Missing question or image file"}, 400)
+                if image is None:
+                    self.send_json({"error": "Missing image file"}, 400)
                     return
+            if model_name == "dinov3":
+                attn_list, num_layers, num_heads, num_register_tokens = run_dinov3_with_attentions(
+                    self.server.model, self.server.processor, image, self.server.device
+                )
+                answer = "DINOv3: CLS→patch attention extracted. Use Layer/Head to view heatmap."
+                tokens = ["CLS"]
+                buf = io.BytesIO()
+                image.save(buf, format="PNG")
+                img_b64 = base64.b64encode(buf.getvalue()).decode()
+                _last_attention_run = {
+                    "attn": attn_list,
+                    "tokens": tokens,
+                    "num_layers": num_layers,
+                    "num_heads": num_heads,
+                    "answer": answer,
+                    "image_base64": img_b64,
+                    "dinov3": True,
+                    "num_register_tokens": num_register_tokens,
+                }
+                self.send_json({
+                    "answer": answer,
+                    "tokens": tokens,
+                    "num_layers": num_layers,
+                    "num_heads": num_heads,
+                    "image_base64": img_b64,
+                    "attention_available": attn_list is not None,
+                })
+                return
+            if model_name not in ("smolvlm2-2.2b", "smolvlm2-500m"):
+                self.send_json({"error": "Attention map only supported for SmolVLM2 or DINOv3. Current model: %s" % model_name}, 400)
+                return
+            if not question:
+                self.send_json({"error": "Missing question (required for SmolVLM2)"}, 400)
+                return
             answer, tokens, attn_list, num_layers, num_heads = run_with_attentions_smolvlm(
                 self.server.model, self.server.processor, image, question, self.server.device
             )
@@ -1731,7 +1888,8 @@ class VLMQAHandler(BaseHTTPRequestHandler):
                     "GET /health": "Health / loading progress",
                     "POST /ask": "Body: multipart (image file + question) or JSON { \"image_base64\": \"...\", \"question\": \"...\" }. Returns { \"answer\": \"...\" }.",
                     "POST /ask_youtube": "Body: JSON { \"url\": \"YouTube URL\", \"time_sec\": 0, \"question\": \"...\" }. Returns { \"answer\": \"...\" }.",
-                    "POST /run_attention": "Same as /ask but with output_attentions (SmolVLM2 only). Returns answer, tokens, attention data.",
+                    "POST /run_attention": "Image + (question for SmolVLM2). Runs with output_attentions. SmolVLM2 or DINOv3 (CLS→patch). Returns answer, tokens, attention data.",
+                    "POST /dinov3_features": "When --model dinov3: image (multipart or JSON image_base64) -> DINOv3 feature shapes and stats.",
                     "POST /detect": "Body: multipart (image file) or JSON { \"image_base64\": \"...\" }. Returns { \"frame_base64\": \"...\", \"detections\": [...] }.",
                     "POST /detect_youtube": "Body: JSON { \"url\": \"YouTube URL\", \"time_sec\": 0 }. Returns { \"frame_base64\": \"...\", \"detections\": [...] } (no VLM).",
                 },
@@ -1756,6 +1914,8 @@ class VLMQAHandler(BaseHTTPRequestHandler):
                 "num_heads": run.get("num_heads", 0),
                 "image_base64": run.get("image_base64"),
                 "attention_available": run.get("attn") is not None,
+                "dinov3": run.get("dinov3", False),
+                "model_name": getattr(self.server, "model_name", "?"),
             })
             return
         if path.startswith("/attention_map"):
@@ -1770,13 +1930,34 @@ class VLMQAHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "No attention data. Run image + question first."}, 400)
                 return
             attn_list, num_layers, num_heads = run["attn"], run["num_layers"], run["num_heads"]
+            if run.get("dinov3"):
+                # DINOv3: CLS→patch attention; token_idx ignored. Layer: -1 = last layer (as in reference repo); head: -1 = mean over heads.
+                layer_eff = (num_layers - 1) if layer == -1 else layer
+                if layer_eff < 0 or layer_eff >= num_layers or head < -1 or head >= num_heads:
+                    self.send_json({"error": "Invalid layer/head (DINOv3: layer -1 or 0..N-1, head -1 or 0..N-1)"}, 400)
+                    return
+                try:
+                    img_raw = base64.b64decode(run["image_base64"])
+                    img = Image.open(io.BytesIO(img_raw)).convert("RGB")
+                    H, W = img.size[1], img.size[0]
+                    heatmap = dinov3_attention_to_heatmap(
+                        attn_list, layer_eff, head, run.get("num_register_tokens", 4), H, W, threshold=threshold
+                    )
+                    if heatmap is None:
+                        self.send_json({"error": "Could not build DINOv3 heatmap"}, 400)
+                        return
+                    b64 = heatmap_to_base64_png(heatmap, threshold=0.0, percentile_normalize=True)
+                    self.send_json({"heatmap": b64})
+                except Exception as e:
+                    self.send_json({"error": str(e)}, 500)
+                return
             if token_idx < 0 or token_idx >= len(attn_list) or layer < -3 or layer >= num_layers or head < -3 or head >= num_heads:
                 self.send_json({"error": "Invalid token/layer/head (layer/head: -3 trimmed, -2 weighted, -1 mean, >=0 single)"}, 400)
                 return
             try:
                 heatmap = attention_to_heatmap(attn_list, token_idx, layer, head, IMAGE_TOKEN_COUNT, threshold=threshold)
                 if heatmap is None:
-                    self.send_json({"error": "Could not build heatmap"}, 400)
+                    self.send_json({"error": "Could not build heatmap (token_idx 0..%d, layer %d, head %d)" % (len(attn_list) - 1, layer, head)}, 400)
                     return
                 raw = attention_raw_vector(attn_list, token_idx, layer, head, IMAGE_TOKEN_COUNT)
                 stats = attention_distribution_stats(raw) if raw is not None else None
@@ -1805,11 +1986,21 @@ class VLMQAHandler(BaseHTTPRequestHandler):
                 return
             attn_list = run["attn"]
             num_layers, num_heads = run["num_layers"], run["num_heads"]
-            if token_idx < 0 or token_idx >= len(attn_list) or layer < -3 or layer >= num_layers or head < -3 or head >= num_heads:
-                self.send_json({"error": "Invalid token/layer/head (layer/head: -3 trimmed, -2 weighted, -1 mean)"}, 400)
-                return
-            try:
+            if run.get("dinov3"):
+                layer_eff = (num_layers - 1) if layer == -1 else layer
+                if layer_eff < 0 or layer_eff >= num_layers or head < -1 or head >= num_heads:
+                    self.send_json({"error": "Invalid layer/head (DINOv3)"}, 400)
+                    return
+                img_raw = base64.b64decode(run["image_base64"])
+                img = Image.open(io.BytesIO(img_raw)).convert("RGB")
+                H_img, W_img = img.size[1], img.size[0]
+                heatmap = dinov3_attention_to_heatmap(attn_list, layer_eff, head, run.get("num_register_tokens", 4), H_img, W_img, threshold=threshold)
+            else:
+                if token_idx < 0 or token_idx >= len(attn_list) or layer < -3 or layer >= num_layers or head < -3 or head >= num_heads:
+                    self.send_json({"error": "Invalid token/layer/head (layer/head: -3 trimmed, -2 weighted, -1 mean)"}, 400)
+                    return
                 heatmap = attention_to_heatmap(attn_list, token_idx, layer, head, IMAGE_TOKEN_COUNT, threshold=threshold)
+            try:
                 if heatmap is None:
                     self.send_json({"error": "Could not build heatmap"}, 400)
                     return
@@ -1853,11 +2044,21 @@ class VLMQAHandler(BaseHTTPRequestHandler):
                 return
             attn_list = run["attn"]
             num_layers, num_heads = run["num_layers"], run["num_heads"]
-            if token_idx < 0 or token_idx >= len(attn_list) or layer < -3 or layer >= num_layers or head < -3 or head >= num_heads:
-                self.send_json({"error": "Invalid token/layer/head (layer/head: -3 trimmed, -2 weighted, -1 mean)"}, 400)
-                return
-            try:
+            if run.get("dinov3"):
+                layer_eff = (num_layers - 1) if layer == -1 else layer
+                if layer_eff < 0 or layer_eff >= num_layers or head < -1 or head >= num_heads:
+                    self.send_json({"error": "Invalid layer/head (DINOv3)"}, 400)
+                    return
+                img_raw = base64.b64decode(run["image_base64"])
+                img = Image.open(io.BytesIO(img_raw)).convert("RGB")
+                H_hm, W_hm = img.size[1], img.size[0]
+                heatmap = dinov3_attention_to_heatmap(attn_list, layer_eff, head, run.get("num_register_tokens", 4), H_hm, W_hm, threshold=threshold)
+            else:
+                if token_idx < 0 or token_idx >= len(attn_list) or layer < -3 or layer >= num_layers or head < -3 or head >= num_heads:
+                    self.send_json({"error": "Invalid token/layer/head (layer/head: -3 trimmed, -2 weighted, -1 mean)"}, 400)
+                    return
                 heatmap = attention_to_heatmap(attn_list, token_idx, layer, head, IMAGE_TOKEN_COUNT, threshold=threshold)
+            try:
                 if heatmap is None:
                     self.send_json({"error": "Could not build heatmap"}, 400)
                     return
@@ -1888,10 +2089,61 @@ class VLMQAHandler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
+    def _handle_dinov3_features(self):
+        """POST /dinov3_features: image (multipart or JSON image_base64) -> DINOv3 feature shapes and stats."""
+        if getattr(self.server, "model_name", "") != "dinov3" or self.server.model is None:
+            self.send_json({"error": "DINOv3 not loaded. Start server with --model dinov3."}, 400)
+            return
+        content_type = self.headers.get("Content-Type", "")
+        image = None
+        try:
+            if "application/json" in content_type:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8") if length else "{}"
+                data = json.loads(body)
+                b64 = data.get("image_base64") or data.get("image") or ""
+                if not b64:
+                    self.send_json({"error": "Missing image_base64"}, 400)
+                    return
+                if "," in str(b64):
+                    b64 = str(b64).split(",", 1)[1]
+                raw = base64.b64decode(b64)
+                image = Image.open(io.BytesIO(raw)).convert("RGB")
+            else:
+                form = cgi.FieldStorage(fp=self.rfile, environ={
+                    "REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+                    "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
+                })
+                if "image" in form:
+                    image = Image.open(form["image"].file).convert("RGB")
+            if image is None:
+                self.send_json({"error": "Missing image"}, 400)
+                return
+            inp = self.server.processor(images=image, return_tensors="pt")
+            inp = {k: (v.to(self.server.device) if hasattr(v, "to") else v) for k, v in inp.items()}
+            with torch.no_grad():
+                out = self.server.model(**inp)
+            pooled = getattr(out, "pooler_output", None) or (out.last_hidden_state[:, 0] if hasattr(out, "last_hidden_state") else None)
+            hidden = getattr(out, "last_hidden_state", None)
+            result = {"model": "dinov3", "model_id": DINOV3_MODEL}
+            if pooled is not None:
+                p = pooled.cpu().numpy()
+                result["pooler_output_shape"] = list(p.shape)
+                result["pooler_output_mean"] = float(p.mean())
+                result["pooler_output_std"] = float(p.std())
+            if hidden is not None:
+                result["last_hidden_state_shape"] = list(hidden.cpu().numpy().shape)
+            self.send_json(result)
+        except Exception as e:
+            self.send_json({"error": str(e)}, 500)
+
     def do_POST(self):
         path = self.path.rstrip("/")
         if path == "/run_attention":
             self._handle_run_attention()
+            return
+        if path == "/dinov3_features":
+            self._handle_dinov3_features()
             return
         if path == "/ask_youtube":
             self._handle_ask_youtube()
@@ -1919,8 +2171,9 @@ class VLMQAHandler(BaseHTTPRequestHandler):
                 data = json.loads(body)
                 question = (data.get("question") or "").strip()
                 b64 = data.get("image_base64") or data.get("image") or ""
-                if not question or not b64:
-                    self.send_json({"error": "Missing question or image_base64", "answer": None}, status=400)
+                need_question = getattr(self.server, "model_name", "") != "dinov3"
+                if not b64 or (need_question and not question):
+                    self.send_json({"error": "Missing image_base64" + (" or question" if need_question else ""), "answer": None}, status=400)
                     return
                 if "," in b64:
                     b64 = b64.split(",", 1)[1]
@@ -1938,8 +2191,9 @@ class VLMQAHandler(BaseHTTPRequestHandler):
                 if "image" in form:
                     fp = form["image"].file
                     image = Image.open(fp).convert("RGB")
-                if not question or image is None:
-                    self.send_json({"error": "Missing question or image file", "answer": None}, status=400)
+                need_question = getattr(self.server, "model_name", "") != "dinov3"
+                if image is None or (need_question and not question):
+                    self.send_json({"error": "Missing image file" + (" or question" if need_question else ""), "answer": None}, status=400)
                     return
             ask_fn = self.server.ask_fn
             device = self.server.device
@@ -1955,9 +2209,9 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="smolvlm2-2.2b",
-        choices=["smolvlm2-2.2b", "smolvlm2-500m", "llava-1.5-7b"],
-        help="VLM to load (default: smolvlm2-2.2b)",
+        default="dinov3",
+        choices=["smolvlm2-2.2b", "smolvlm2-500m", "llava-1.5-7b", "dinov3"],
+        help="Model to load: VLM (smolvlm2, llava) or DINOv3 vision backbone (default: dinov3)",
     )
     args = parser.parse_args()
 
@@ -1985,6 +2239,9 @@ def main():
         if args.model == "llava-1.5-7b":
             server.model, server.processor = load_llava(device, progress_callback=set_progress)
             server.ask_fn = ask_llava
+        elif args.model == "dinov3":
+            server.model, server.processor = load_dinov3(device, progress_callback=set_progress)
+            server.ask_fn = ask_dinov3
         else:
             name = SMOLVLM2_2B if args.model == "smolvlm2-2.2b" else SMOLVLM2_500M
             server.model, server.processor = load_smolvlm(name, device, progress_callback=set_progress)
