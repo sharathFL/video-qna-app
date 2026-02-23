@@ -15,3 +15,4 @@ qwen-vl-utils
 num2words
 psutil
 yt-dlp>=2024.1.0
+timm  # required for DETR object-detection pipeline (serve_vlm_qa.py)

@@ -49,6 +49,16 @@ INDEX_HTML = """<!DOCTYPE html>
     <p style="margin-top:0.5rem; font-size:0.85rem;">If 8083 doesn’t load, run <code>docker compose ps</code> and ensure the <code>youtube</code> service is up.</p>
   </div>
 
+  <div class="card">
+    <h2><a href="http://localhost:8086/" target="_blank" rel="noopener">8086 — Multiclass video inference</a></h2>
+    <p>8-class behavior classification on test videos (separate compose: <code>docker-compose.multiclass-inference.yml</code>).</p>
+  </div>
+
+  <div class="card">
+    <h2><a href="http://localhost:8087/" target="_blank" rel="noopener">8087 — VLM QA</a></h2>
+    <p>Ask questions about an image (e.g. &quot;Is the person wearing a hardhat? yes/no&quot;). SmolVLM2 or LLaVA 7B on GPU. For YouTube/webcam streams: send frames + questions, build answers from replies.</p>
+  </div>
+
   <p style="margin-top: 2rem; color: #666; font-size: 0.85rem;">
     When running training manually (not via compose):<br>
     Binary training dashboard → 8080 (or 8081 if you changed it).<br>
