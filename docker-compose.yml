@@ -22,13 +22,7 @@ services:
     ports:
       - "8080:8080"
       - "8082:8082"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    
 
   # YouTube inference on 8083: paste URL, embed video, run inference (no download)
   youtube:
@@ -52,20 +46,14 @@ services:
     tty: true
     ports:
       - "8083:8083"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    
 
   # VLM QA on 8087: DINOv3 (default) or SmolVLM2/LLaVA. DINOv3 = vision backbone only (no QA); use /dinov3_features. VLMs: ask questions, attention map (SmolVLM2).
   vlm_qa:
     build: .
     container_name: vlm_qa
     working_dir: /workspace
-    command: ["python", "src/serve_vlm_qa.py", "--port", "8087", "--model", "dinov3"]
+    command: ["python", "src/serve_vlm_qa.py", "--port", "8087", "--model", "smolvlm2-500m"]
     volumes:
       - ./src:/workspace/src:rw
       - ./cache/hf:/workspace/.cache/huggingface:rw
@@ -82,10 +70,4 @@ services:
     tty: true
     ports:
       - "8087:8087"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    
