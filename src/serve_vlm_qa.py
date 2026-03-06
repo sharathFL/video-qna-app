@@ -235,7 +235,7 @@ def ask_smolvlm(model, processor, image: Image.Image, question: str, device) -> 
         }
     ]
     inp = processor.apply_chat_template(
-        [messages],
+        messages,
         add_generation_prompt=True,
         tokenize=True,
         return_dict=True,
@@ -1429,7 +1429,7 @@ HTML_PAGE = """<!DOCTYPE html>
             question: q
           });
           body = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body };
-          fetch('/ask', body)
+          fetch('/ask', {method: 'POST', headers:{'Content-Type': 'application/json'}, body:JSON.stringify({image_base64: capturedDataUrl.split(',')[1], question: q})})
             .then(function(r) { return r.json(); })
             .then(function(d) {
               showResult(d.error || d.answer || '', !!d.error);
