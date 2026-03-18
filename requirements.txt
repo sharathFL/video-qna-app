@@ -4,7 +4,7 @@ accelerate>=0.33.0
 peft>=0.12.0
 bitsandbytes>=0.43.0
 pillow
-opencv-python
+opencv-python-headless
 torch>=2.4.0
 torchvision
 datasets
@@ -19,3 +19,5 @@ timm  # required for DETR object-detection pipeline (serve_vlm_qa.py)
 uvicorn[standard]
 fastapi
 python-multipart
+ultralytics       # YOLO inference
+ollama            # Qwen2.5-VL via local Ollama server
