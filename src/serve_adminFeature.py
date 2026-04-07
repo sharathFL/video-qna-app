@@ -171,31 +171,50 @@ YOLO_INTENTS = [
     "have ", "has ",
 ]
 
-# These words signal reasoning is needed — always send to Ollama
+# These words signal reasoning is needed — always send to VLM.
+# IMPORTANT: keep these specific — do NOT add words that overlap with
+# counting/presence intent (e.g. "visible", "have", "all", "any", "look").
 REASONING_SIGNALS = [
     "correctly", "properly", "safely", "appropriately",
-    "look", "appear", "seem", "behav",
-    "posture", "position", "organized", "clean",
-    "secure", "right way", "correct way",
-    "should", "risk", "danger", "hazard",
+    "appear to be", "seems to be", "behav",
+    "posture", "organized", "clean",
+    "right way", "correct way",
+    "risk", "danger", "hazard",
     "idle", "distract", "fatigue", "tired",
     # Opinion / sentiment / open-ended — needs VLM
-    "sentiment", "emotion", "feel", "mood",
+    "sentiment", "emotion", "mood",
     "describe", "explain", "what is happening",
-    "overall", "general", "assess", "evaluate",
+    "overall", "assess", "evaluate",
+]
+
+# These intents confirm YOLO can handle it — checked AFTER reasoning signals.
+YOLO_INTENTS = [
+    "how many", "count", "number of",
+    "wearing", "not wearing", "without",
+    "present", "visible", "detected",
+    "any ", "all ", "is there", "are there",
+    "have ", "has ",
 ]
 
 def is_yolo_question(q: str) -> bool:
     """
-    YOLO is the default route.
-    Only send to Ollama if the question explicitly contains
-    reasoning signals that YOLO cannot answer.
+    Route to YOLO if the question has a clear detection/counting intent
+    AND no reasoning signal. Reasoning signals take priority.
+    Fallback (no match either way) also goes to YOLO since YOLO runs
+    unconditionally and can always return a generic detection summary.
     """
     lower = q.lower()
-    # Only these signals force Ollama — everything else goes to YOLO
+    # Reasoning signals take absolute priority
     if any(sig in lower for sig in REASONING_SIGNALS):
         return False
-    return True
+    # Explicit YOLO-compatible intent found → YOLO
+    if any(intent in lower for intent in YOLO_INTENTS):
+        return True
+    # Question mentions a detectable object → YOLO can at least count it
+    if any(obj in lower for obj in YOLO_OBJECTS):
+        return True
+    # Truly open-ended with no detectable object → VLM
+    return False
 
 
 # ── YOLO answer builder ───────────────────────────────────────────────────────
@@ -1102,7 +1121,7 @@ function renderResults(data, elapsed, label) {
     const rsrc     = r.route_source || '';
     const srcColor = src === 'YOLO' ? 'var(--green-t)' : src === 'Ollama' ? '#79c0ff' : 'var(--red-t)';
     const altRoute = src === 'YOLO' ? 'smolvlm' : 'yolo';
-    const altLabel = src === 'YOLO' ? 'Switch to Ollama' : 'Switch to YOLO';
+    const altLabel = src === 'YOLO' ? 'Switch to SmolVLM' : 'Switch to YOLO';
     const rawBlock = (src === 'Ollama' && r.raw)
       ? `<div id="raw-${i}-${Date.now()}" style="display:none;margin-top:8px;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-size:.72rem;font-family:var(--mono);color:var(--muted);white-space:pre-wrap;max-height:120px;overflow-y:auto">${esc(r.raw)}</div>`
       : '';
@@ -1416,8 +1435,19 @@ async def analyze(
     vlm_questions   = []
 
     for i, q in enumerate(questions):
-        # Route everything to SmolVLM2 for now
-        vlm_questions.append((i, q, "smolvlm-all"))
+        # 1. Check routing memory first (learned corrections take priority)
+        learned_route, sim, pat_id = find_learned_route(q, routing_memory)
+        if learned_route == "yolo":
+            yolo_questions.append((i, q, f"memory:{pat_id}(sim={sim})"))
+        elif learned_route == "smolvlm":
+            vlm_questions.append((i, q, f"memory:{pat_id}(sim={sim})"))
+        # 2. Fall back to keyword router
+        elif is_yolo_question(q):
+            yolo_questions.append((i, q, "keyword-router"))
+        else:
+            vlm_questions.append((i, q, "keyword-router"))
+    print(f"[ROUTE] YOLO: {[q for _,q,_ in yolo_questions]}")
+    print(f"[ROUTE] VLM:  {[q for _,q,_ in vlm_questions]}")
 
     results   = [None] * len(questions)
     raw_parts = ["[YOLO detections] " + str(detections)]
