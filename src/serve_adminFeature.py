@@ -26,6 +26,8 @@ import re
 import time
 import threading
 from io import BytesIO
+import httpx
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -59,6 +61,8 @@ yolo_person_model = None
 smolvlm_ready     = False
 smolvlm_model     = None
 smolvlm_processor = None
+ALARM_API_URL = "https://1c41-106-51-87-203.ngrok-free.app/api/sensor/heartbeat"  # replace with real URL
+SENSOR_ID     = "cam-001"  # your camera/sensor ID
 
 # -- Routing Memory Agent --
 MEMORY_PATH = "/workspace/outputs/routing_memory.json"
@@ -311,7 +315,7 @@ def answer_with_yolo(question: str, detections: dict) -> str:
         return f"All {persons} worker(s) appear to have required PPE."
 
     # Fallback
-    return f"Detected — persons: {persons}, helmets: {helmets}, vests: {vests}, machinery: {machinery}, vehicles: {vehicles}."
+    return None
 
 
 # ── Face blur ─────────────────────────────────────────────────────────────────
@@ -1298,6 +1302,18 @@ function toast(msg){
 </html>"""
 
 
+
+async def send_heartbeat(status: str, image_b64: str, timestamp: str):
+    payload = {
+        "sensor_id":   SENSOR_ID,
+        "timestamp":   timestamp,
+        "status":      status,
+        "image_frame": image_b64,
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(ALARM_API_URL, json=payload, timeout=3)
+        print(f"[Heartbeat] {status} → {resp.status_code}")
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -1453,11 +1469,18 @@ async def analyze(
     raw_parts = ["[YOLO detections] " + str(detections)]
 
     # -- Answer YOLO questions --
+    # After answering YOLO questions:
+    vlm_escalations = []
     for i, q, rsrc in yolo_questions:
-        answer = answer_with_yolo(q, detections)
+      answer = answer_with_yolo(q, detections)
+      if answer is None:
+        # YOLO couldn't answer — escalate to SmolVLM2
+        vlm_escalations.append((i, q, "yolo-escalation"))
+      else:
         results[i] = {"question": q, "answer": answer, "source": "YOLO", "route_source": rsrc}
-        raw_parts.append("[YOLO] Q" + str(i+1) + ": " + q + "\n-> " + answer)
 
+    # Merge escalations into vlm_questions before SmolVLM2 call
+    vlm_questions = vlm_escalations + vlm_questions
     # -- Answer SmolVLM2 questions --
     if vlm_questions:
         if smolvlm_ready:
@@ -1490,6 +1513,32 @@ async def analyze(
     total_time    = round(time.time() - t_total, 2)
     ram_after     = proc.memory_info().rss / 1024 / 1024
     mem           = psutil.virtual_memory()
+
+    status = "Normal"
+    for r in results:
+      if r is None:
+        continue
+      q = r["question"].lower()
+      a = r["answer"].lower()
+    
+      if "smoke" in q and any(w in a for w in ["yes", "detected", "visible", "present"]):
+        status = "Smoke Detected"
+        break
+      if any(w in q for w in ["human", "person", "worker", "people"]) and any(w in a for w in ["yes", "detected", "visible", "present"]):
+        status = "Human Detected"
+
+    if status != "Normal":
+      buf = BytesIO()
+      pil_image.save(buf, format="JPEG", quality=85)
+      image_b64 = base64.b64encode(buf.getvalue()).decode()
+      try:
+          await send_heartbeat(
+              status    = status,
+              image_b64 = image_b64,
+              timestamp = datetime.utcnow().isoformat() + "Z",
+          )
+      except Exception as e:
+          print(f"[Heartbeat] API unavailable, skipping: {e}")
 
     return JSONResponse({
         "results":        results,
@@ -1552,7 +1601,6 @@ async def get_memory():
         "total_patterns": len(mem["patterns"]),
         "patterns": mem["patterns"],
     }
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host=args.host, port=args.port)
